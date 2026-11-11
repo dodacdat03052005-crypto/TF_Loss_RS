@@ -83,11 +83,35 @@ def read_result(dataset, loss_name, horizon):
     if not files:
         return None
     df = pd.read_csv(files[-1])
-    row = df.iloc[0]
     out = {}
-    for m in METRICS:
-        col = next((c for c in df.columns if c.endswith(m)), None)
-        out[m] = row[col] if col is not None else float("nan")
+    if "metric_name" in df.columns:
+        score_cols = [c for c in df.columns if c not in ["strategy_args", "metric_name"]]
+        if not score_cols:
+            return None
+        score_col = score_cols[-1]
+        for m in METRICS:
+            stem = m.replace("_norm", "")
+            match = df[df["metric_name"].astype(str).str.contains(stem, case=False, na=False)]
+            if not match.empty:
+                val = match.iloc[0][score_col]
+                try:
+                    out[m] = float(val)
+                except (ValueError, TypeError):
+                    out[m] = float("nan")
+            else:
+                out[m] = float("nan")
+    else:
+        row = df.iloc[0]
+        for m in METRICS:
+            stem = m.replace("_norm", "")
+            col = next((c for c in df.columns if stem in c.lower()), None)
+            if col is not None:
+                try:
+                    out[m] = float(row[col])
+                except (ValueError, TypeError):
+                    out[m] = float("nan")
+            else:
+                out[m] = float("nan")
     return out
 
 
