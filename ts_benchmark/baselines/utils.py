@@ -69,6 +69,69 @@ class DBLoss(nn.Module):
         return self.beta * season_loss + (1 - self.beta) * trend_loss
 
 
+class HD_DBLoss(nn.Module):
+    """
+    Heteroscedastic Decomposition-Based Loss (HD-DBLoss)
+    - Trend: Non-stationary, penalized by time steps weighting or MLE with learnable gamma.
+    - Seasonal: Stationary, uniform weighting (Standard MSE).
+    """
+
+    def __init__(
+        self,
+        alpha=0.1,
+        lambda_trend=1.0,
+        lambda_season=1.0,
+        gamma=0.5,
+        learnable_gamma=False,
+        lambda_reg=1.0,
+    ):
+        super().__init__()
+        self.decomp = DECOMP(alpha)
+        self.lambda_trend = lambda_trend
+        self.lambda_season = lambda_season
+        self.learnable_gamma = learnable_gamma
+        self.lambda_reg = lambda_reg
+
+        # gamma: learnable parameter or fixed value
+        if learnable_gamma:
+            self.gamma = nn.Parameter(torch.tensor(float(gamma)))
+        else:
+            self.gamma = float(gamma)
+
+    def forward(self, pred, target):
+        device = pred.device
+        dtype = pred.dtype
+        _, H_steps, _ = pred.shape
+
+        # 1. Decompose
+        pred_season, pred_trend = self.decomp(pred)
+        target_season, target_trend = self.decomp(target)
+
+        # 2. Seasonal loss (stationary -> uniform MSE)
+        season_loss = torch.mean((pred_season - target_season) ** 2)
+
+        # 3. Horizon index vector h [1, H, 1]
+        h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)
+
+        # 4. Trend squared error
+        trend_sq_error = (pred_trend - target_trend) ** 2
+
+        if self.learnable_gamma:
+            # Multi-task MLE with regularizer: err / h^gamma + lambda_reg * gamma * ln(h)
+            trend_loss_matrix = (trend_sq_error / (h ** self.gamma)) + (
+                self.lambda_reg * self.gamma * torch.log(h)
+            )
+            trend_loss = torch.mean(trend_loss_matrix)
+        else:
+            # Normalized fixed-gamma weights (mean weight = 1 keeps gradient scale)
+            w_tilde = 1.0 / (h ** self.gamma)
+            w = w_tilde / torch.mean(w_tilde)
+            trend_loss = torch.mean(trend_sq_error * w)
+
+        # 5. Combine
+        return self.lambda_trend * trend_loss + self.lambda_season * season_loss
+
+
 def adjust_learning_rate(optimizer, epoch, args):
     # lr = args.learning_rate * (0.2 ** (epoch // 2))
     if args.lradj == "type1":

@@ -16,7 +16,8 @@ from ts_benchmark.baselines.utils import (
     forecasting_data_provider,
     train_val_split,
     get_time_mark,
-    DBLoss
+    DBLoss,
+    HD_DBLoss,
 )
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_time
@@ -37,7 +38,13 @@ DEFAULT_HYPER_PARAMS = {
     "adj_lr_in_batch": False,
     "parallel_strategy": None,
     "alpha": 0.2,
-    "beta": 0.5
+    "beta": 0.5,
+    # HD_DBLoss hyper parameters
+    "lambda_trend": 1.0,
+    "lambda_season": 1.0,
+    "gamma": 0.5,
+    "learnable_gamma": False,
+    "lambda_reg": 1.0,
 }
 
 
@@ -135,10 +142,21 @@ class DeepForecastingModelBase(ModelBase):
             criterion = nn.L1Loss()
         elif self.config.loss == "DBLoss":
             criterion = DBLoss(self.config.alpha, self.config.beta)
+        elif self.config.loss == "HD_DBLoss":
+            criterion = HD_DBLoss(
+                alpha=self.config.alpha,
+                lambda_trend=self.config.lambda_trend,
+                lambda_season=self.config.lambda_season,
+                gamma=self.config.gamma,
+                learnable_gamma=bool(self.config.learnable_gamma),
+                lambda_reg=self.config.lambda_reg,
+            )
         else:
             criterion = nn.HuberLoss(delta=0.5)
 
-        optimizer = optim.Adam(self.model.parameters(), lr=self.config.lr)
+        # Include learnable loss parameters (e.g. HD_DBLoss gamma), if any
+        params = list(self.model.parameters()) + list(criterion.parameters())
+        optimizer = optim.Adam(params, lr=self.config.lr)
         return criterion, optimizer
 
     def _process(self, input, target, input_mark, target_mark):
@@ -441,6 +459,8 @@ class DeepForecastingModelBase(ModelBase):
             scaler = torch.cuda.amp.GradScaler()
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Ensure any learnable loss parameters (e.g. HD_DBLoss gamma) live on the same device
+        criterion = criterion.to(device)
 
         self.early_stopping = self._init_early_stopping()
         self.model.to(device)
