@@ -40,11 +40,18 @@ DEFAULT_HYPER_PARAMS = {
     "alpha": 0.2,
     "beta": 0.5,
     # HD_DBLoss hyper parameters
+    "gamma": 0.3,
+    "gamma_min": 0.05,
+    "tau": 1.5,
+    "h0": 0.0,
+    "trend_loss_type": "mae",
+    "align_scale": True,
+    "gamma_anneal": True,
+    "eval_uniform": True,
+    "learnable_gamma": False,
+    "lambda_reg": 0.1,
     "lambda_trend": 1.0,
     "lambda_season": 1.0,
-    "gamma": 0.5,
-    "learnable_gamma": False,
-    "lambda_reg": 1.0,
 }
 
 
@@ -145,11 +152,19 @@ class DeepForecastingModelBase(ModelBase):
         elif self.config.loss == "HD_DBLoss":
             criterion = HD_DBLoss(
                 alpha=self.config.alpha,
-                lambda_trend=self.config.lambda_trend,
-                lambda_season=self.config.lambda_season,
+                beta=self.config.beta,
                 gamma=self.config.gamma,
+                gamma_min=self.config.gamma_min,
+                tau=self.config.tau,
+                h0=self.config.h0,
+                trend_loss_type=self.config.trend_loss_type,
+                align_scale=self.config.align_scale,
+                gamma_anneal=self.config.gamma_anneal,
+                eval_uniform=self.config.eval_uniform,
                 learnable_gamma=bool(self.config.learnable_gamma),
                 lambda_reg=self.config.lambda_reg,
+                lambda_trend=self.config.lambda_trend,
+                lambda_season=self.config.lambda_season,
             )
         else:
             criterion = nn.HuberLoss(delta=0.5)
@@ -472,6 +487,8 @@ class DeepForecastingModelBase(ModelBase):
 
         for epoch in range(config.num_epochs):
             self.model.train()
+            if hasattr(criterion, "set_epoch"):
+                criterion.set_epoch(epoch, config.num_epochs)
             # for input, target, input_mark, target_mark in train_data_loader:
             for i, (input, target, input_mark, target_mark) in enumerate(
                 self.train_data_loader
