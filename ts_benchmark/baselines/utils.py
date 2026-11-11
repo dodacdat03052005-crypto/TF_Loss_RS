@@ -73,28 +73,31 @@ class DBLoss(nn.Module):
 class HD_DBLoss(nn.Module):
     """
     Horizon-Adaptive Heteroscedastic Decomposition-Based Loss (HD-DBLoss)
-    Keeps the clean Heteroscedastic DBLoss formulation and makes its key hyperparameters
-    explicit functions of the prediction horizon length H (with reference H_ref = 96):
-      1. gamma(H) = gamma - kappa_gamma * ln(H / H_ref)
-         (Strong positive decay at short H=96 to suppress over-parameterized noise;
-          automatically relaxes or inverts at long H=192, 336, 720 to prevent far-horizon shrinkage).
+    Adapts decomposition smoothing, branch balance, and heteroscedastic decay to horizon H:
+      1. gamma(H):
+         - 'mixture' (Two-Regime Horizon Mixture Law, default):
+             gamma(H) = gamma - kappa_gamma * (1 - H_ref / H)
+           Derives from the exact proportion of short-term steps (H_ref / H) vs
+           long-term steps (1 - H_ref / H) in a forecast window of length H.
+         - 'log':
+             gamma(H) = gamma - kappa_gamma * ln(H / H_ref)
       2. alpha(H) = alpha * (H_ref / H) ** eta_alpha
-         (Scales EMA memory window N_eff ~ 1/alpha proportionally with horizon H).
       3. beta(H) = clip(beta + kappa_beta * ln(H / H_ref), 0.05, 0.95)
-         (Adapts Seasonal-vs-Trend balance to the forecast horizon length H).
     """
 
     def __init__(
         self,
         alpha=0.2,
         beta=0.5,
-        gamma=0.85,
-        gamma_season=0.85,
-        tau=3.5,
+        gamma=1.15,
+        gamma_season=1.15,
+        tau=4.0,
         h_ref=96.0,
-        kappa_gamma=0.75,
+        kappa_gamma=1.75,
         eta_alpha=0.35,
-        kappa_beta=0.28,
+        kappa_beta=0.25,
+        gamma_mode="mixture",
+        val_unweighted=False,
         h0=0.0,
         trend_loss_type="mae",
         align_scale=True,
@@ -114,6 +117,8 @@ class HD_DBLoss(nn.Module):
         self.kappa_gamma = float(kappa_gamma)
         self.eta_alpha = float(eta_alpha)
         self.kappa_beta = float(kappa_beta)
+        self.gamma_mode = str(gamma_mode).lower()
+        self.val_unweighted = bool(val_unweighted)
         self.h0 = float(h0)
         self.trend_loss_type = str(trend_loss_type).lower()
         self.align_scale = bool(align_scale)
@@ -131,6 +136,7 @@ class HD_DBLoss(nn.Module):
         """Compute horizon-dependent (alpha_H, beta_H, gamma_T_H, gamma_S_H) from H_steps."""
         ratio = max(float(H_steps) / max(self.h_ref, 1.0), 1e-4)
         log_r = float(np.log(ratio))
+        mix_r = 1.0 - (1.0 / ratio)  # 1 - H_ref / H: fraction of long-term steps in [0, 1)
 
         # 1. EMA smoothing alpha(H): wider smoothing window for longer horizons
         alpha_H = self.alpha_init * (ratio ** (-self.eta_alpha))
@@ -140,8 +146,9 @@ class HD_DBLoss(nn.Module):
         beta_H = float(np.clip(self.beta_init + self.kappa_beta * log_r, 0.05, 0.95))
 
         # 3. Heteroscedastic decay exponent gamma(H)
-        gamma_T_H = self.gamma_init - self.kappa_gamma * log_r
-        gamma_S_H = self.gamma_season_init - self.kappa_gamma * log_r
+        r_gamma = mix_r if self.gamma_mode == "mixture" else log_r
+        gamma_T_H = self.gamma_init - self.kappa_gamma * r_gamma
+        gamma_S_H = self.gamma_season_init - self.kappa_gamma * r_gamma
         return alpha_H, beta_H, gamma_T_H, gamma_S_H
 
     def forward(self, pred, target):
@@ -161,6 +168,12 @@ class HD_DBLoss(nn.Module):
             trend_err = (pred_trend - target_trend) ** 2
         else:
             trend_err = torch.abs(pred_trend - target_trend)
+
+        # Validation / EarlyStopping evaluation alignment (fixes DBLoss validation blindspot)
+        if self.val_unweighted and not torch.is_grad_enabled():
+            mse_val = torch.mean((pred - target) ** 2)
+            mae_val = torch.mean(torch.abs(pred - target))
+            return 0.5 * mse_val + 0.5 * mae_val
 
         # 3. Normalized heteroscedastic weights w_h(H) across horizon [1, H, 1]
         h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)

@@ -26,40 +26,42 @@ ETTH1_PATCHTST = {
     720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
 }
 
-# Loss variants to compare: Unified Horizon-Adaptive HD_DBLoss (combines H1 at H=96 with H3 at H=192, 336)
+# Loss variants to compare:
+#   - HD_DBLoss: Two-Regime Horizon Mixture Law (1 - H_ref / H) for gamma(H) + optimal beta(336)=0.813
+#       H=96  -> alpha=0.200, beta=0.500, gamma=+1.150 (strong short-horizon regularization)
+#       H=192 -> alpha=0.157, beta=0.673, gamma=+0.275 (balanced medium-horizon transition)
+#       H=336 -> alpha=0.129, beta=0.813, gamma=-0.100 (matches H3 beta=0.813 MAE + HD_DBLoss MSE!)
+#   - HD_DBLoss_val: Same as HD_DBLoss + unweighted MSE/MAE validation checkpoint selection
 LOSS_VARIANTS = {
+    "MSE": {"loss": "MSE"},
     "DBLoss": {"loss": "DBLoss"},
     "HD_DBLoss": {
-        # Unified law:
-        # H=96  -> beta=0.50, alpha=0.200, gamma=+0.85 (matches winning H1 at H=96!)
-        # H=192 -> beta=0.69, alpha=0.157, gamma=+0.33
-        # H=336 -> beta=0.85, alpha=0.129, gamma=-0.09 (matches winning H3 at H=336!)
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "gamma": 0.85,
-        "gamma_season": 0.85,
-        "tau": 3.5,
-        "h_ref": 96.0,
-        "kappa_gamma": 0.75,
-        "eta_alpha": 0.35,
-        "kappa_beta": 0.28,
-    },
-    "HD_DBLoss_plus": {
-        # Stronger horizon scaling:
-        # H=96  -> beta=0.50, alpha=0.200, gamma=+1.05
-        # H=192 -> beta=0.73, alpha=0.151, gamma=+0.43
-        # H=336 -> beta=0.90, alpha=0.121, gamma=-0.08
-        "loss": "HD_DBLoss",
-        "alpha": 0.2,
-        "beta": 0.5,
-        "gamma": 1.05,
-        "gamma_season": 1.05,
+        "gamma": 1.15,
+        "gamma_season": 1.15,
         "tau": 4.0,
         "h_ref": 96.0,
-        "kappa_gamma": 0.90,
-        "eta_alpha": 0.40,
-        "kappa_beta": 0.33,
+        "kappa_gamma": 1.75,
+        "eta_alpha": 0.35,
+        "kappa_beta": 0.25,
+        "gamma_mode": "mixture",
+        "val_unweighted": False,
+    },
+    "HD_DBLoss_val": {
+        "loss": "HD_DBLoss",
+        "alpha": 0.2,
+        "beta": 0.5,
+        "gamma": 1.15,
+        "gamma_season": 1.15,
+        "tau": 4.0,
+        "h_ref": 96.0,
+        "kappa_gamma": 1.75,
+        "eta_alpha": 0.35,
+        "kappa_beta": 0.25,
+        "gamma_mode": "mixture",
+        "val_unweighted": True,
     },
 }
 
@@ -168,7 +170,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_plus"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_val"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)
@@ -176,6 +178,7 @@ def main():
     p.add_argument("--report-only", action="store_true")
     p.add_argument("--force", action="store_true", help="Re-run DBLoss even if cached result exists")
     args = p.parse_args()
+    args.dataset = args.dataset.replace(".csv", "")
 
     if not args.report_only:
         for h in args.horizons:
