@@ -52,41 +52,56 @@ BENCHMARK_CONFIGS = {
     },
 }
 
-# Loss variants to compare (Step-wise Empirical Variance Weighting, fixed alpha=0.2, beta=0.5):
-#   1. HD_DBLoss:    Seasonal inverse-variance only (gamma_S=0.5, gamma_T=0.0)
-#   2. HD_DBLoss_ST: Seasonal inverse-variance + Trend trajectory retention (gamma_S=0.5, gamma_T=0.25)
+# Loss variants to compare (TSG-DBLoss / Unified HD_DBLoss Ablation):
+#   1. HD_DBLoss_Gate: Iso-Energy Step-Wise Spectral Gate beta(h) only (alpha_fast=1.0, channel_snr_gamma=0.0)
+#   2. HD_DBLoss_Tri:  Tri-Band Decomposition (T, S, R) + Iso-Energy Gate beta(h) (alpha_fast=0.6, channel_snr_gamma=0.0)
+#   3. HD_DBLoss:      Full TSG-DBLoss (Tri-Band + Iso-Energy Gate beta(h) + Shift-Invariant Channel SNR w_c)
 LOSS_VARIANTS = {
     "MSE": {"loss": "MSE"},
     "DBLoss": {"loss": "DBLoss"},
+    "HD_DBLoss_Gate": {
+        "loss": "HD_DBLoss",
+        "alpha": 0.2,
+        "beta": 0.5,
+        "alpha_fast": 1.0,
+        "delta_beta": 0.15,
+        "channel_snr_gamma": 0.0,
+    },
+    "HD_DBLoss_Tri": {
+        "loss": "HD_DBLoss",
+        "alpha": 0.2,
+        "beta": 0.5,
+        "alpha_fast": 0.6,
+        "delta_beta": 0.15,
+        "huber_delta": 1.0,
+        "channel_snr_gamma": 0.0,
+    },
     "HD_DBLoss": {
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "gamma_S": 0.5,
-        "gamma_T": 0.0,
-        "momentum": 0.95,
-    },
-    "HD_DBLoss_ST": {
-        "loss": "HD_DBLoss",
-        "alpha": 0.2,
-        "beta": 0.5,
-        "gamma_S": 0.5,
-        "gamma_T": 0.25,
-        "momentum": 0.95,
+        "alpha_fast": 0.6,
+        "delta_beta": 0.15,
+        "huber_delta": 1.0,
+        "channel_snr_gamma": 0.05,
     },
 }
 
 METRICS = ["mse_norm", "mae_norm"]
 
 
-def save_path(dataset, model, loss_name, horizon, batch_size=None):
-    h_tag = f"H{horizon}" if batch_size is None else f"H{horizon}_bs{batch_size}"
+def save_path(dataset, model, loss_name, horizon, batch_size=None, seed=None):
+    h_tag = f"H{horizon}"
+    if batch_size is not None:
+        h_tag += f"_bs{batch_size}"
+    if seed is not None:
+        h_tag += f"_s{seed}"
     if model == "PatchTST":
         return f"{dataset}/compare/{loss_name}/{h_tag}"
     return f"{dataset}/{model}/compare/{loss_name}/{h_tag}"
 
 
-def run_one(dataset, model, loss_name, horizon, args):
+def run_one(dataset, model, loss_name, horizon, args, seed_tag=None):
     cfg_map = BENCHMARK_CONFIGS.get((dataset, model), BENCHMARK_CONFIGS[("ETTh1", "PatchTST")])
     params = dict(cfg_map[horizon])
     params["horizon"] = horizon
@@ -108,17 +123,23 @@ def run_one(dataset, model, loss_name, horizon, args):
         "--gpus", str(args.gpu),
         "--num-workers", "2",
         "--timeout", "60000",
-        "--save-path", save_path(dataset, model, loss_name, horizon, args.batch_size),
+        "--save-path", save_path(dataset, model, loss_name, horizon, args.batch_size, seed_tag),
     ]
-    if args.seed is not None:
-        cmd += ["--seed", str(args.seed)]
+    run_seed = seed_tag if seed_tag is not None else args.seed
+    if run_seed is not None:
+        cmd += ["--seed", str(run_seed)]
     bs_info = params.get("batch_size", 32)
-    print(f"\n===== {loss_name} | {dataset} | {model} | horizon={horizon} | batch_size={bs_info} =====", flush=True)
+    print(
+        f"\n===== {loss_name} | {dataset} | {model} | horizon={horizon} | batch_size={bs_info} | seed={run_seed} =====",
+        flush=True,
+    )
     subprocess.run(cmd, cwd=ROOT, check=False)
 
 
-def read_result(dataset, model, loss_name, horizon, batch_size=None):
-    pattern = os.path.join(ROOT, "result", save_path(dataset, model, loss_name, horizon, batch_size), "test_report*.csv")
+def read_result(dataset, model, loss_name, horizon, batch_size=None, seed=None):
+    pattern = os.path.join(
+        ROOT, "result", save_path(dataset, model, loss_name, horizon, batch_size, seed), "test_report*.csv"
+    )
     files = sorted(glob.glob(pattern), key=os.path.getmtime)
     if not files:
         return None
@@ -155,34 +176,64 @@ def read_result(dataset, model, loss_name, horizon, batch_size=None):
     return out
 
 
-def build_table(dataset, model, horizons, losses, batch_size=None):
+def build_table(dataset, model, horizons, losses, batch_size=None, seeds=(None,)):
+    """
+    Build comparison table. With multiple seeds, each cell is the mean over seeds,
+    `<loss>_std` is the across-seed standard deviation, and the AVG row is computed
+    per seed first (mean over horizons) and then aggregated across seeds.
+    """
+    seeds = list(seeds)
+    multi = len(seeds) > 1
+    # vals[loss][metric][horizon] -> list of per-seed values (NaN-free)
+    vals = {l: {m: {h: [] for h in horizons} for m in METRICS} for l in losses}
+    for h in horizons:
+        for l in losses:
+            for s in seeds:
+                res = read_result(dataset, model, l, h, batch_size, s)
+                if res:
+                    for m in METRICS:
+                        if pd.notna(res[m]):
+                            vals[l][m][h].append(res[m])
+
+    def summarize(values):
+        if not values:
+            return float("nan"), float("nan"), 0
+        ser = pd.Series(values, dtype=float)
+        std = float(ser.std(ddof=1)) if len(ser) > 1 else float("nan")
+        return float(ser.mean()), std, len(ser)
+
+    def add_cells(row, per_loss_values):
+        for l in losses:
+            mean, std, n = summarize(per_loss_values[l])
+            row[l] = mean
+            if multi:
+                row[f"{l}_std"] = std
+                row[f"{l}_n"] = n
+        base = row.get("DBLoss")
+        for l in losses:
+            if l != "DBLoss" and base and pd.notna(row[l]) and pd.notna(base):
+                row[f"{l} vs DBLoss (%)"] = (base - row[l]) / base * 100
+
     rows = []
     for h in horizons:
-        res = {l: read_result(dataset, model, l, h, batch_size) for l in losses}
         for m in METRICS:
             row = {"horizon": str(h), "metric": m.replace("_norm", "").upper()}
-            for l in losses:
-                row[l] = res[l][m] if res[l] else float("nan")
-            base = row.get("DBLoss")
-            for l in losses:
-                if l != "DBLoss" and base and pd.notna(row[l]) and pd.notna(base):
-                    row[f"{l} vs DBLoss (%)"] = (base - row[l]) / base * 100
+            add_cells(row, {l: vals[l][m][h] for l in losses})
             rows.append(row)
-    df = pd.DataFrame(rows)
-    if len(horizons) > 1 and not df.empty:
-        avg_rows = []
-        for m_label in ["MSE", "MAE"]:
-            sub = df[df["metric"] == m_label]
-            avg_row = {"horizon": "AVG", "metric": m_label}
+
+    if len(horizons) > 1:
+        for m in METRICS:
+            row = {"horizon": "AVG", "metric": m.replace("_norm", "").upper()}
+            per_loss = {}
             for l in losses:
-                avg_row[l] = sub[l].mean()
-            base = avg_row.get("DBLoss")
-            for l in losses:
-                if l != "DBLoss" and base and pd.notna(avg_row[l]) and pd.notna(base):
-                    avg_row[f"{l} vs DBLoss (%)"] = (base - avg_row[l]) / base * 100
-            avg_rows.append(avg_row)
-        df = pd.concat([df, pd.DataFrame(avg_rows)], ignore_index=True)
-    return df
+                # Per-seed average across horizons (only seeds present for all horizons)
+                n_common = min(len(vals[l][m][h]) for h in horizons)
+                per_loss[l] = [
+                    sum(vals[l][m][h][i] for h in horizons) / len(horizons) for i in range(n_common)
+                ]
+            add_cells(row, per_loss)
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def main():
@@ -193,26 +244,37 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_ST"],
+        default=["DBLoss", "HD_DBLoss_Gate", "HD_DBLoss_Tri", "HD_DBLoss"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--batch-size", type=int, default=None, help="Override training batch_size (e.g. 128 or 256 for faster GPU runs)")
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None, help="Single seed (results stored in the legacy, untagged path)")
+    p.add_argument(
+        "--seeds", type=int, nargs="+", default=None,
+        help="Run every loss with several seeds (stored in seed-tagged paths) and report mean/std",
+    )
     p.add_argument("--report-only", action="store_true")
     p.add_argument("--force", action="store_true", help="Re-run DBLoss even if cached result exists")
     args = p.parse_args()
     args.dataset = args.dataset.replace(".csv", "")
 
-    if not args.report_only:
-        for h in args.horizons:
-            for l in args.losses:
-                if l == "DBLoss" and not args.force and read_result(args.dataset, args.model, l, h, args.batch_size) is not None:
-                    print(f"\n===== Skipping {l} | {args.dataset} | {args.model} | horizon={h} (already exists) =====", flush=True)
-                    continue
-                run_one(args.dataset, args.model, l, h, args)
+    seed_tags = args.seeds if args.seeds else [None]
 
-    table = build_table(args.dataset, args.model, args.horizons, args.losses, args.batch_size)
+    if not args.report_only:
+        for s in seed_tags:
+            for h in args.horizons:
+                for l in args.losses:
+                    cached = read_result(args.dataset, args.model, l, h, args.batch_size, s) is not None
+                    if l == "DBLoss" and not args.force and cached:
+                        print(
+                            f"\n===== Skipping {l} | {args.dataset} | {args.model} | horizon={h} | seed={s} (already exists) =====",
+                            flush=True,
+                        )
+                        continue
+                    run_one(args.dataset, args.model, l, h, args, s)
+
+    table = build_table(args.dataset, args.model, args.horizons, args.losses, args.batch_size, seed_tags)
     pd.set_option("display.width", 200)
     print("\n" + table.to_string(index=False, float_format=lambda v: f"{v:.6f}"))
     suffix = f"{args.dataset}" if args.model == "PatchTST" else f"{args.dataset}_{args.model}"
