@@ -26,30 +26,48 @@ ETTH1_PATCHTST = {
     720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
 }
 
-# Loss variants to compare: name -> extra hyper params
+# Loss variants to compare: Horizon-Adaptive HD_DBLoss (scaling hyperparameters with H)
 LOSS_VARIANTS = {
     "DBLoss": {"loss": "DBLoss"},
-    "TF_DBLoss": {
+    "HD_DBLoss_H1": {
+        # 1. Horizon-adaptive gamma(H) + alpha(H) (keeps beta=0.5)
+        # H=96: gamma=0.85, alpha=0.20 | H=192: gamma=0.33, alpha=0.15 | H=336: gamma=-0.09, alpha=0.13
         "loss": "HD_DBLoss",
-        "mode": "tf",
-        "freq_weight": 0.35,
-        "patch_weight": 0.4,
+        "alpha": 0.2,
+        "beta": 0.5,
+        "gamma": 0.85,
+        "gamma_season": 0.85,
+        "tau": 3.5,
+        "h_ref": 96.0,
+        "kappa_gamma": 0.75,
+        "eta_alpha": 0.35,
+        "kappa_beta": 0.0,
     },
-    "IC_DBLoss": {
+    "HD_DBLoss_H2": {
+        # 2. Horizon-adaptive gamma(H) + low beta (Trend-focused like ETTm1/ETTh2 beta=0.2)
         "loss": "HD_DBLoss",
-        "mode": "ic",
-        "freq_weight": 0.25,
+        "alpha": 0.15,
+        "beta": 0.25,
+        "gamma": 0.85,
+        "gamma_season": 0.85,
+        "tau": 3.5,
+        "h_ref": 96.0,
+        "kappa_gamma": 0.75,
+        "eta_alpha": 0.0,
+        "kappa_beta": -0.05,
     },
-    "HD_DBLoss": {
+    "HD_DBLoss_H3": {
+        # 3. Horizon-adaptive gamma(H) + high beta (Season-focused like ETTh1 iTransformer beta=0.8)
         "loss": "HD_DBLoss",
-        "mode": "v2",
-        "gamma": 0.4,
-        "gamma_season": 0.4,
-        "tau": 2.0,
-        "trend_loss_type": "mae",
-        "align_scale": True,
-        "gamma_anneal": False,
-        "eval_uniform": False,
+        "alpha": 0.2,
+        "beta": 0.75,
+        "gamma": 0.85,
+        "gamma_season": 0.85,
+        "tau": 3.5,
+        "h_ref": 96.0,
+        "kappa_gamma": 0.75,
+        "eta_alpha": 0.35,
+        "kappa_beta": 0.05,
     },
 }
 
@@ -158,7 +176,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "TF_DBLoss", "IC_DBLoss"],
+        default=["DBLoss", "HD_DBLoss_H1", "HD_DBLoss_H2", "HD_DBLoss_H3"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)
