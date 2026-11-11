@@ -39,13 +39,10 @@ DEFAULT_HYPER_PARAMS = {
     "parallel_strategy": None,
     "alpha": 0.2,
     "beta": 0.5,
-    # HD_DBLoss (TSG-DBLoss) hyper parameters
-    "alpha_fast": 0.6,
-    "delta_beta": 0.15,
-    "huber_delta": 1.0,
-    "lambda_R": 1.0,
-    "channel_snr_gamma": 0.05,
-    "anneal_steps": 0,
+    # HD_DBLoss hyper parameters (First-Principles Precision Ratio)
+    "gamma": 1.0,
+    "c_step": 0.015,
+    "step_decay": 0.0,
 }
 
 
@@ -147,12 +144,9 @@ class DeepForecastingModelBase(ModelBase):
             criterion = HD_DBLoss(
                 alpha=self.config.alpha,
                 beta=self.config.beta,
-                alpha_fast=self.config.alpha_fast,
-                delta_beta=self.config.delta_beta,
-                huber_delta=self.config.huber_delta,
-                lambda_R=self.config.lambda_R,
-                channel_snr_gamma=self.config.channel_snr_gamma,
-                anneal_steps=self.config.anneal_steps,
+                gamma=self.config.gamma,
+                c_step=self.config.c_step,
+                step_decay=self.config.step_decay,
             )
         else:
             criterion = nn.HuberLoss(delta=0.5)

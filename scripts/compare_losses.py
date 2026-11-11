@@ -52,38 +52,27 @@ BENCHMARK_CONFIGS = {
     },
 }
 
-# Loss variants to compare (TSG-DBLoss / Unified HD_DBLoss Ablation):
-#   1. HD_DBLoss_Gate: Iso-Energy Step-Wise Spectral Gate beta(h) only (alpha_fast=1.0, channel_snr_gamma=0.0)
-#   2. HD_DBLoss_Tri:  Tri-Band Decomposition (T, S, R) + Iso-Energy Gate beta(h) (alpha_fast=0.6, channel_snr_gamma=0.0)
-#   3. HD_DBLoss:      Full TSG-DBLoss (Tri-Band + Iso-Energy Gate beta(h) + Shift-Invariant Channel SNR w_c)
+# Loss variants to compare (First-Principles Stationary Seasonal vs Non-Stationary Trend Precision Ratio):
+#   w_T(h) = (1 + c_step * (h - 1)) ** (-gamma),   w_S(h) = 1.0
+#   beta(h) = beta / (beta + (1 - beta) * w_T(h))  [Depends ONLY on step h, NEVER on horizon H!]
 LOSS_VARIANTS = {
     "MSE": {"loss": "MSE"},
     "DBLoss": {"loss": "DBLoss"},
-    "HD_DBLoss_Gate": {
-        "loss": "HD_DBLoss",
-        "alpha": 0.2,
-        "beta": 0.5,
-        "alpha_fast": 1.0,
-        "delta_beta": 0.15,
-        "channel_snr_gamma": 0.0,
-    },
-    "HD_DBLoss_Tri": {
-        "loss": "HD_DBLoss",
-        "alpha": 0.2,
-        "beta": 0.5,
-        "alpha_fast": 0.6,
-        "delta_beta": 0.15,
-        "huber_delta": 1.0,
-        "channel_snr_gamma": 0.0,
-    },
     "HD_DBLoss": {
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "alpha_fast": 0.6,
-        "delta_beta": 0.15,
-        "huber_delta": 1.0,
-        "channel_snr_gamma": 0.05,
+        "gamma": 1.0,
+        "c_step": 0.015,
+        "step_decay": 0.0,
+    },
+    "HD_DBLoss_s2": {
+        "loss": "HD_DBLoss",
+        "alpha": 0.2,
+        "beta": 0.5,
+        "gamma": 1.2,
+        "c_step": 0.020,
+        "step_decay": 0.0,
     },
 }
 
@@ -244,7 +233,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss_Gate", "HD_DBLoss_Tri", "HD_DBLoss"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_s2"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--batch-size", type=int, default=None, help="Override training batch_size (e.g. 128 or 256 for faster GPU runs)")

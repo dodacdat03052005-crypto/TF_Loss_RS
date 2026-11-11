@@ -141,121 +141,67 @@ class TRI_DECOMP(nn.Module):
 
 class HD_DBLoss(nn.Module):
     """
-    Tri-Scale Spectral-Gated Decomposition Loss (TSG-DBLoss / Unified HD_DBLoss).
+    Heteroscedastic Decomposition-Based Loss (HD-DBLoss) — Pure First-Principles Formulation.
 
-    Unifies three orthogonal, mathematically principled mechanisms:
-      1. Tri-Band Causal EMA Decomposition (Trend T, Harmonic Seasonality S, Stochastic Residual R)
-         with L2 on S, curvature-matched Huber loss (2 * F.huber_loss) on R, and L1 on T.
-      2. Anchor-Protected Iso-Energy Step-Wise Spectral Gate beta(h): preserves anchor weight
-         beta(1) = beta at h=1 (where causal detrended signal is 0) and modulates beta(h)
-         across h = 2..H while strictly preserving beta(h) + (1 - beta(h)) == 1.0 at every
-         step h and preserving mean(beta(h)) == beta.
-      3. Shift- & Scale-Invariant Target-Driven Channel SNR Weighting w_c: weights variates
-         by the window-centered intrinsic signal-to-noise ratio of ground-truth target Y.
+    Derived directly from:
+      1. Stationary Seasonal I(0) precision:     w_S(h) = 1.0
+      2. Non-stationary Trend I(1) precision:    w_T(h) = (1 + c * (h - 1)) ** (-gamma)
+         (Depends ONLY on physical forecast lead time h = 1, 2, ..., NEVER on horizon length H!)
+      3. Iso-Energy Precision Normalization at each step h (prevents the Evaluation Trap):
+         beta(h) = (beta * w_S(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
+                 = beta / (beta + (1 - beta) * (1 + c * (h - 1)) ** (-gamma))
+         1 - beta(h) = ((1 - beta) * w_T(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
     """
 
     def __init__(
         self,
         alpha: float = 0.2,
         beta: float = 0.5,
-        alpha_fast: float = 0.6,
-        delta_beta: float = 0.15,
-        huber_delta: float = 1.0,
-        lambda_R: float = 1.0,
-        channel_snr_gamma: float = 0.05,
-        anneal_steps: int = 0,
+        gamma: float = 1.0,
+        c_step: float = 0.015,
+        step_decay: float = 0.0,
         **kwargs,
     ):
         super().__init__()
+        self.decomp = DECOMP(alpha)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        self.alpha_fast = float(alpha_fast)
-        self.delta_beta = float(delta_beta)
-        self.huber_delta = float(huber_delta)
-        self.lambda_R = float(lambda_R)
-        self.channel_snr_gamma = float(channel_snr_gamma)
-        self.anneal_steps = int(anneal_steps)
-        self.tri_decomp = TRI_DECOMP(alpha_slow=self.alpha, alpha_fast=self.alpha_fast)
-        self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long), persistent=False)
-
-    def _build_spectral_gate(
-        self, H: int, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        """
-        Constructs the Anchor-Protected Iso-Energy Step-Wise Spectral Gate beta(h) of shape [1, H, 1].
-        - At h=0 (first step, where causal detrended S=R=0): beta(0) = self.beta (protects anchor L1).
-        - Across h=1..H-1: linearly interpolates from beta + max_delta to beta - max_delta.
-        - Strictly satisfies beta(h) + (1 - beta(h)) == 1.0 for all h and mean(beta(h)) == self.beta.
-        """
-        if H <= 2 or self.delta_beta == 0.0:
-            return torch.full((1, H, 1), self.beta, device=device, dtype=dtype)
-
-        eff_delta = self.delta_beta
-        if self.anneal_steps > 0 and self.training:
-            progress = min(1.0, float(self._step_count.item()) / float(self.anneal_steps))
-            eff_delta = self.delta_beta * (1.25 - 0.25 * progress)
-
-        max_delta = min(eff_delta, self.beta - 0.02, 0.98 - self.beta)
-        max_delta = max(max_delta, 0.0)
-
-        tau = torch.linspace(0.0, 1.0, steps=H - 1, device=device, dtype=dtype)
-        beta_active = self.beta + max_delta * (1.0 - 2.0 * tau)
-        beta_anchor = torch.full((1,), self.beta, device=device, dtype=dtype)
-        beta_h = torch.cat([beta_anchor, beta_active], dim=0)
-        return beta_h.view(1, H, 1)
-
-    def _compute_channel_weights(
-        self, r_true: torch.Tensor, s_true: torch.Tensor, t_true: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Computes shift-invariant and scale-invariant channel-wise SNR weights w_c of shape [1, 1, C]
-        purely from ground-truth target components (zero dependence on pred).
-        """
-        _, _, C = t_true.shape
-        if C <= 1 or self.channel_snr_gamma <= 0.0:
-            return torch.ones((1, 1, C), device=t_true.device, dtype=t_true.dtype)
-
-        with torch.no_grad():
-            t_centered = t_true.detach() - t_true.detach().mean(dim=1, keepdim=True)
-            signal_energy = (t_centered ** 2 + s_true.detach() ** 2).mean(dim=(0, 1))
-            noise_energy = (r_true.detach() ** 2).mean(dim=(0, 1))
-            snr_c = signal_energy / (noise_energy + 1e-6)
-            w_c = (snr_c + 1e-6) ** self.channel_snr_gamma
-            w_c = w_c / (w_c.mean() + 1e-8)
-        return w_c.view(1, 1, C)
+        self.gamma = float(gamma)
+        self.c_step = float(c_step)
+        self.step_decay = float(step_decay)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         _, H, _ = pred.shape
-        if self.training and torch.is_grad_enabled():
-            self._step_count += 1
+        device = pred.device
+        dtype = pred.dtype
 
-        # 1. Exact Tri-Band Causal EMA Decomposition: X = T + S + R
-        r_pred, s_pred, t_pred = self.tri_decomp(pred)
-        r_true, s_true, t_true = self.tri_decomp(target)
+        # 1. Original 2-branch EMA Decomposition (identical to DBLoss)
+        pred_season, pred_trend = self.decomp(pred)
+        target_season, target_trend = self.decomp(target)
 
-        # 2. Component-wise point errors [B, H, C]
-        err_season = (s_pred - s_true) ** 2
-        if self.alpha_fast < 1.0 and self.lambda_R > 0.0:
-            err_res = 2.0 * F.huber_loss(
-                r_pred, r_true, reduction="none", delta=self.huber_delta
-            )
-            err_sr = err_season + self.lambda_R * err_res
-        else:
-            err_sr = err_season
+        err_season = (pred_season - target_season) ** 2        # [B, H, C]
+        err_trend = torch.abs(pred_trend - target_trend)       # [B, H, C]
 
-        err_trend = torch.abs(t_pred - t_true)
+        # 2. Global gradient scale alignment (identical to DBLoss)
+        scale = (err_season.mean() / (err_trend.mean() + 1e-8)).detach()
+        err_trend_aligned = err_trend * scale
 
-        # 3. Global Batch Scale Alignment
-        scale_factor = (err_sr.mean() / (err_trend.mean() + 1e-8)).detach()
-        err_trend_aligned = err_trend * scale_factor
+        # 3. Step-wise precision ratio from Non-Stationary Trend w_T(h) vs Stationary Seasonal w_S(h)=1
+        #    Note: h = 1, 2, ..., H is physical lead time (independent of total horizon H!)
+        h = torch.arange(1, H + 1, device=device, dtype=dtype).view(1, H, 1)
+        w_T = torch.pow(1.0 + self.c_step * (h - 1.0), -self.gamma)
 
-        # 4. Anchor-Protected Iso-Energy Gate beta(h) [1, H, 1] & Shift-Invariant Channel SNR Weight w_c [1, 1, C]
-        beta_h = self._build_spectral_gate(H, pred.device, pred.dtype)
-        w_c = self._compute_channel_weights(r_true, s_true, t_true)
+        # Iso-energy precision share at step h: beta(h) + (1 - beta(h)) == 1.0 for every h
+        beta_h = self.beta / (self.beta + (1.0 - self.beta) * w_T + 1e-8)
 
-        # 5. Unified Iso-Energy Loss Aggregation
-        step_gated_loss = beta_h * err_sr + (1.0 - beta_h) * err_trend_aligned
-        return (w_c * step_gated_loss).mean()
+        step_loss = beta_h * err_season + (1.0 - beta_h) * err_trend_aligned
+
+        if self.step_decay != 0.0:
+            w_all = torch.pow(1.0 + self.c_step * (h - 1.0), -self.step_decay)
+            w_all = w_all / (w_all.mean() + 1e-8)
+            step_loss = step_loss * w_all
+
+        return step_loss.mean()
 
 
 def adjust_learning_rate(optimizer, epoch, args):
