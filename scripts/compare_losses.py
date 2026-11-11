@@ -31,28 +31,24 @@ LOSS_VARIANTS = {
     "DBLoss": {"loss": "DBLoss"},
     "HD_DBLoss": {
         "loss": "HD_DBLoss",
-        "gamma": 0.6,
-        "gamma_season": 0.0,
-        "gamma_min": 0.0,
-        "anneal_decay": 0.3,
+        "gamma": 0.4,
+        "gamma_season": 0.4,
         "tau": 2.0,
         "trend_loss_type": "mae",
         "align_scale": True,
-        "gamma_anneal": True,
-        "eval_uniform": True,
+        "gamma_anneal": False,
+        "eval_uniform": False,
         "learnable_gamma": False,
     },
-    "HD_DBLoss_dual": {
+    "HD_DBLoss_strong": {
         "loss": "HD_DBLoss",
-        "gamma": 0.5,
-        "gamma_season": 0.4,
-        "gamma_min": 0.0,
-        "anneal_decay": 0.3,
-        "tau": 2.0,
+        "gamma": 0.6,
+        "gamma_season": 0.6,
+        "tau": 3.0,
         "trend_loss_type": "mae",
         "align_scale": True,
-        "gamma_anneal": True,
-        "eval_uniform": True,
+        "gamma_anneal": False,
+        "eval_uniform": False,
         "learnable_gamma": False,
     },
     "HD_DBLoss_fixed": {
@@ -68,12 +64,12 @@ LOSS_VARIANTS = {
     },
     "HD_DBLoss_learnable": {
         "loss": "HD_DBLoss",
-        "gamma": 0.5,
-        "gamma_season": 0.0,
+        "gamma": 0.4,
+        "gamma_season": 0.4,
         "tau": 2.0,
         "trend_loss_type": "mae",
         "align_scale": True,
-        "eval_uniform": True,
+        "eval_uniform": False,
         "learnable_gamma": True,
         "lambda_reg": 0.1,
     },
@@ -152,7 +148,7 @@ def build_table(dataset, horizons, losses):
     for h in horizons:
         res = {l: read_result(dataset, l, h) for l in losses}
         for m in METRICS:
-            row = {"horizon": h, "metric": m.replace("_norm", "").upper()}
+            row = {"horizon": str(h), "metric": m.replace("_norm", "").upper()}
             for l in losses:
                 row[l] = res[l][m] if res[l] else float("nan")
             base = row.get("DBLoss")
@@ -160,7 +156,21 @@ def build_table(dataset, horizons, losses):
                 if l != "DBLoss" and base and pd.notna(row[l]) and pd.notna(base):
                     row[f"{l} vs DBLoss (%)"] = (base - row[l]) / base * 100
             rows.append(row)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if len(horizons) > 1 and not df.empty:
+        avg_rows = []
+        for m_label in ["MSE", "MAE"]:
+            sub = df[df["metric"] == m_label]
+            avg_row = {"horizon": "AVG", "metric": m_label}
+            for l in losses:
+                avg_row[l] = sub[l].mean()
+            base = avg_row.get("DBLoss")
+            for l in losses:
+                if l != "DBLoss" and base and pd.notna(avg_row[l]) and pd.notna(base):
+                    avg_row[f"{l} vs DBLoss (%)"] = (base - avg_row[l]) / base * 100
+            avg_rows.append(avg_row)
+        df = pd.concat([df, pd.DataFrame(avg_rows)], ignore_index=True)
+    return df
 
 
 def main():
@@ -170,7 +180,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_dual", "HD_DBLoss_fixed"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_strong"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)
