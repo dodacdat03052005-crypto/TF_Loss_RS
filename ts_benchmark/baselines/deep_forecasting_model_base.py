@@ -437,8 +437,8 @@ class DeepForecastingModelBase(ModelBase):
                 valid_data,
                 config,
                 timeenc=1,
-                batch_size=config.batch_size,
-                shuffle=True,
+                batch_size=max(config.batch_size, 256),
+                shuffle=False,
                 drop_last=False,
             )
 
@@ -636,7 +636,8 @@ class DeepForecastingModelBase(ModelBase):
         self.model.to(device)
         self.model.eval()
 
-        input_data = batch_maker.make_batch(self.config.batch_size, self.config.seq_len)
+        eval_bs = max(self.config.batch_size, 256)
+        input_data = batch_maker.make_batch(eval_bs, self.config.seq_len)
         input_np = input_data["input"]
 
         series_dim = input_np.shape[-1]

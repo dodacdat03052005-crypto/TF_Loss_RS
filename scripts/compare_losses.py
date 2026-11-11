@@ -79,16 +79,19 @@ LOSS_VARIANTS = {
 METRICS = ["mse_norm", "mae_norm"]
 
 
-def save_path(dataset, model, loss_name, horizon):
+def save_path(dataset, model, loss_name, horizon, batch_size=None):
+    h_tag = f"H{horizon}" if batch_size is None else f"H{horizon}_bs{batch_size}"
     if model == "PatchTST":
-        return f"{dataset}/compare/{loss_name}/H{horizon}"
-    return f"{dataset}/{model}/compare/{loss_name}/H{horizon}"
+        return f"{dataset}/compare/{loss_name}/{h_tag}"
+    return f"{dataset}/{model}/compare/{loss_name}/{h_tag}"
 
 
 def run_one(dataset, model, loss_name, horizon, args):
     cfg_map = BENCHMARK_CONFIGS.get((dataset, model), BENCHMARK_CONFIGS[("ETTh1", "PatchTST")])
     params = dict(cfg_map[horizon])
     params["horizon"] = horizon
+    if args.batch_size is not None:
+        params["batch_size"] = args.batch_size
     loss_cfg = dict(LOSS_VARIANTS[loss_name])
     # Respect dataset/model-specific base beta if defined in official script
     if "beta" in params and loss_name.startswith("HD_DBLoss"):
@@ -103,18 +106,19 @@ def run_one(dataset, model, loss_name, horizon, args):
         "--model-name", f"time_series_library.{model}",
         "--model-hyper-params", json.dumps(params),
         "--gpus", str(args.gpu),
-        "--num-workers", "1",
+        "--num-workers", "2",
         "--timeout", "60000",
-        "--save-path", save_path(dataset, model, loss_name, horizon),
+        "--save-path", save_path(dataset, model, loss_name, horizon, args.batch_size),
     ]
     if args.seed is not None:
         cmd += ["--seed", str(args.seed)]
-    print(f"\n===== {loss_name} | {dataset} | {model} | horizon={horizon} =====", flush=True)
+    bs_info = params.get("batch_size", 32)
+    print(f"\n===== {loss_name} | {dataset} | {model} | horizon={horizon} | batch_size={bs_info} =====", flush=True)
     subprocess.run(cmd, cwd=ROOT, check=False)
 
 
-def read_result(dataset, model, loss_name, horizon):
-    pattern = os.path.join(ROOT, "result", save_path(dataset, model, loss_name, horizon), "test_report*.csv")
+def read_result(dataset, model, loss_name, horizon, batch_size=None):
+    pattern = os.path.join(ROOT, "result", save_path(dataset, model, loss_name, horizon, batch_size), "test_report*.csv")
     files = sorted(glob.glob(pattern), key=os.path.getmtime)
     if not files:
         return None
@@ -151,10 +155,10 @@ def read_result(dataset, model, loss_name, horizon):
     return out
 
 
-def build_table(dataset, model, horizons, losses):
+def build_table(dataset, model, horizons, losses, batch_size=None):
     rows = []
     for h in horizons:
-        res = {l: read_result(dataset, model, l, h) for l in losses}
+        res = {l: read_result(dataset, model, l, h, batch_size) for l in losses}
         for m in METRICS:
             row = {"horizon": str(h), "metric": m.replace("_norm", "").upper()}
             for l in losses:
@@ -192,6 +196,7 @@ def main():
         default=["DBLoss", "HD_DBLoss", "HD_DBLoss_ST"],
         choices=list(LOSS_VARIANTS),
     )
+    p.add_argument("--batch-size", type=int, default=None, help="Override training batch_size (e.g. 128 or 256 for faster GPU runs)")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--report-only", action="store_true")
@@ -202,12 +207,12 @@ def main():
     if not args.report_only:
         for h in args.horizons:
             for l in args.losses:
-                if l == "DBLoss" and not args.force and read_result(args.dataset, args.model, l, h) is not None:
+                if l == "DBLoss" and not args.force and read_result(args.dataset, args.model, l, h, args.batch_size) is not None:
                     print(f"\n===== Skipping {l} | {args.dataset} | {args.model} | horizon={h} (already exists) =====", flush=True)
                     continue
                 run_one(args.dataset, args.model, l, h, args)
 
-    table = build_table(args.dataset, args.model, args.horizons, args.losses)
+    table = build_table(args.dataset, args.model, args.horizons, args.losses, args.batch_size)
     pd.set_option("display.width", 200)
     print("\n" + table.to_string(index=False, float_format=lambda v: f"{v:.6f}"))
     suffix = f"{args.dataset}" if args.model == "PatchTST" else f"{args.dataset}_{args.model}"
