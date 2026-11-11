@@ -26,12 +26,14 @@ ETTH1_PATCHTST = {
     720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
 }
 
-# Loss variants to compare: Horizon-Adaptive HD_DBLoss (scaling hyperparameters with H)
+# Loss variants to compare: Unified Horizon-Adaptive HD_DBLoss (combines H1 at H=96 with H3 at H=192, 336)
 LOSS_VARIANTS = {
     "DBLoss": {"loss": "DBLoss"},
-    "HD_DBLoss_H1": {
-        # 1. Horizon-adaptive gamma(H) + alpha(H) (keeps beta=0.5)
-        # H=96: gamma=0.85, alpha=0.20 | H=192: gamma=0.33, alpha=0.15 | H=336: gamma=-0.09, alpha=0.13
+    "HD_DBLoss": {
+        # Unified law:
+        # H=96  -> beta=0.50, alpha=0.200, gamma=+0.85 (matches winning H1 at H=96!)
+        # H=192 -> beta=0.69, alpha=0.157, gamma=+0.33
+        # H=336 -> beta=0.85, alpha=0.129, gamma=-0.09 (matches winning H3 at H=336!)
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
@@ -41,33 +43,23 @@ LOSS_VARIANTS = {
         "h_ref": 96.0,
         "kappa_gamma": 0.75,
         "eta_alpha": 0.35,
-        "kappa_beta": 0.0,
+        "kappa_beta": 0.28,
     },
-    "HD_DBLoss_H2": {
-        # 2. Horizon-adaptive gamma(H) + low beta (Trend-focused like ETTm1/ETTh2 beta=0.2)
-        "loss": "HD_DBLoss",
-        "alpha": 0.15,
-        "beta": 0.25,
-        "gamma": 0.85,
-        "gamma_season": 0.85,
-        "tau": 3.5,
-        "h_ref": 96.0,
-        "kappa_gamma": 0.75,
-        "eta_alpha": 0.0,
-        "kappa_beta": -0.05,
-    },
-    "HD_DBLoss_H3": {
-        # 3. Horizon-adaptive gamma(H) + high beta (Season-focused like ETTh1 iTransformer beta=0.8)
+    "HD_DBLoss_plus": {
+        # Stronger horizon scaling:
+        # H=96  -> beta=0.50, alpha=0.200, gamma=+1.05
+        # H=192 -> beta=0.73, alpha=0.151, gamma=+0.43
+        # H=336 -> beta=0.90, alpha=0.121, gamma=-0.08
         "loss": "HD_DBLoss",
         "alpha": 0.2,
-        "beta": 0.75,
-        "gamma": 0.85,
-        "gamma_season": 0.85,
-        "tau": 3.5,
+        "beta": 0.5,
+        "gamma": 1.05,
+        "gamma_season": 1.05,
+        "tau": 4.0,
         "h_ref": 96.0,
-        "kappa_gamma": 0.75,
-        "eta_alpha": 0.35,
-        "kappa_beta": 0.05,
+        "kappa_gamma": 0.90,
+        "eta_alpha": 0.40,
+        "kappa_beta": 0.33,
     },
 }
 
@@ -176,7 +168,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss_H1", "HD_DBLoss_H2", "HD_DBLoss_H3"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_plus"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)
