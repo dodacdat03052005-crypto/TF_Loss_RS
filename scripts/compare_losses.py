@@ -18,20 +18,43 @@ import pandas as pd
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# PatchTST hyper-parameters per horizon for ETTh1 (taken from scripts/multivariate_forecast/ETTh1_script/PatchTST.sh)
-ETTH1_PATCHTST = {
-    96: {"d_ff": 2048, "d_model": 512, "e_layers": 1, "factor": 3, "n_headers": 2, "norm": True, "seq_len": 96},
-    192: {"d_ff": 512, "d_model": 128, "norm": True, "seq_len": 512},
-    336: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
-    720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
+# Official hyper-parameters per (dataset, model, horizon) from scripts/multivariate_forecast/
+BENCHMARK_CONFIGS = {
+    ("ETTh1", "PatchTST"): {
+        96: {"d_ff": 2048, "d_model": 512, "e_layers": 1, "factor": 3, "n_headers": 2, "norm": True, "seq_len": 96},
+        192: {"d_ff": 512, "d_model": 128, "norm": True, "seq_len": 512},
+        336: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
+        720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
+    },
+    ("ETTh1", "DLinear"): {
+        96: {"batch_size": 32, "d_ff": 2048, "d_model": 512, "lr": 0.005, "norm": True, "seq_len": 336},
+        192: {"batch_size": 64, "d_ff": 2048, "d_model": 512, "lr": 0.001, "norm": True, "period_len": 24, "seq_len": 336, "station_lr": 1e-05},
+        336: {"batch_size": 32, "d_ff": 2048, "d_model": 512, "lr": 0.005, "norm": True, "seq_len": 336},
+        720: {"batch_size": 64, "d_ff": 2048, "d_model": 512, "factor": 3, "norm": True, "period_len": 24, "seq_len": 336, "station_lr": 0.0001},
+    },
+    ("ETTh1", "iTransformer"): {
+        96: {"beta": 0.9, "d_ff": 256, "d_model": 256, "e_layers": 2, "norm": True, "seq_len": 96},
+        192: {"beta": 0.9, "d_ff": 256, "d_model": 256, "e_layers": 2, "norm": True, "seq_len": 512},
+        336: {"beta": 0.9, "d_ff": 128, "d_model": 128, "e_layers": 2, "norm": True, "seq_len": 512},
+        720: {"beta": 0.9, "d_ff": 512, "d_model": 512, "e_layers": 2, "norm": True, "seq_len": 96},
+    },
+    ("ETTh2", "PatchTST"): {
+        96: {"beta": 0.2, "d_ff": 128, "d_model": 32, "norm": True, "seq_len": 512},
+        192: {"d_ff": 128, "d_model": 32, "norm": True, "seq_len": 512},
+        336: {"d_ff": 128, "d_model": 32, "norm": True, "seq_len": 512},
+        720: {"beta": 0.2, "d_ff": 128, "d_model": 32, "norm": True, "seq_len": 336},
+    },
+    ("ETTm1", "PatchTST"): {
+        96: {"beta": 0.1, "d_ff": 256, "d_model": 128, "norm": True, "seq_len": 336},
+        192: {"beta": 0.1, "d_ff": 256, "d_model": 128, "norm": True, "seq_len": 336},
+        336: {"beta": 0.1, "d_ff": 64, "d_model": 32, "norm": True, "seq_len": 512},
+        720: {"beta": 0.1, "d_ff": 256, "d_model": 128, "norm": True, "seq_len": 336},
+    },
 }
 
-# Loss variants to compare:
-#   - HD_DBLoss: Two-Regime Horizon Mixture Law (1 - H_ref / H) for gamma(H) + optimal beta(336)=0.813
-#       H=96  -> alpha=0.200, beta=0.500, gamma=+1.150 (strong short-horizon regularization)
-#       H=192 -> alpha=0.157, beta=0.673, gamma=+0.275 (balanced medium-horizon transition)
-#       H=336 -> alpha=0.129, beta=0.813, gamma=-0.100 (matches H3 beta=0.813 MAE + HD_DBLoss MSE!)
-#   - HD_DBLoss_val: Same as HD_DBLoss + unweighted MSE/MAE validation checkpoint selection
+# Loss variants to compare (Step-wise Empirical Variance Weighting, fixed alpha=0.2, beta=0.5):
+#   1. HD_DBLoss:    Seasonal inverse-variance only (gamma_S=0.5, gamma_T=0.0)
+#   2. HD_DBLoss_ST: Seasonal inverse-variance + Trend trajectory retention (gamma_S=0.5, gamma_T=0.25)
 LOSS_VARIANTS = {
     "MSE": {"loss": "MSE"},
     "DBLoss": {"loss": "DBLoss"},
@@ -39,64 +62,59 @@ LOSS_VARIANTS = {
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "gamma": 1.15,
-        "gamma_season": 1.15,
-        "tau": 4.0,
-        "h_ref": 96.0,
-        "kappa_gamma": 1.75,
-        "eta_alpha": 0.35,
-        "kappa_beta": 0.25,
-        "gamma_mode": "mixture",
-        "val_unweighted": False,
+        "gamma_S": 0.5,
+        "gamma_T": 0.0,
+        "momentum": 0.95,
     },
-    "HD_DBLoss_val": {
+    "HD_DBLoss_ST": {
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "gamma": 1.15,
-        "gamma_season": 1.15,
-        "tau": 4.0,
-        "h_ref": 96.0,
-        "kappa_gamma": 1.75,
-        "eta_alpha": 0.35,
-        "kappa_beta": 0.25,
-        "gamma_mode": "mixture",
-        "val_unweighted": True,
+        "gamma_S": 0.5,
+        "gamma_T": 0.25,
+        "momentum": 0.95,
     },
 }
 
 METRICS = ["mse_norm", "mae_norm"]
 
 
-def save_path(dataset, loss_name, horizon):
-    return f"{dataset}/compare/{loss_name}/H{horizon}"
+def save_path(dataset, model, loss_name, horizon):
+    if model == "PatchTST":
+        return f"{dataset}/compare/{loss_name}/H{horizon}"
+    return f"{dataset}/{model}/compare/{loss_name}/H{horizon}"
 
 
-def run_one(dataset, loss_name, horizon, args):
-    params = dict(ETTH1_PATCHTST[horizon])
+def run_one(dataset, model, loss_name, horizon, args):
+    cfg_map = BENCHMARK_CONFIGS.get((dataset, model), BENCHMARK_CONFIGS[("ETTh1", "PatchTST")])
+    params = dict(cfg_map[horizon])
     params["horizon"] = horizon
-    params.update(LOSS_VARIANTS[loss_name])
+    loss_cfg = dict(LOSS_VARIANTS[loss_name])
+    # Respect dataset/model-specific base beta if defined in official script
+    if "beta" in params and loss_name.startswith("HD_DBLoss"):
+        loss_cfg["beta"] = params["beta"]
+    params.update(loss_cfg)
     cmd = [
         sys.executable, os.path.join(ROOT, "scripts", "run_benchmark.py"),
         "--config-path", "rolling_forecast_config.json",
         "--data-name-list", f"{dataset}.csv",
         "--strategy-args", json.dumps({"horizon": horizon}),
         "--adapter", "transformer_adapter",
-        "--model-name", "time_series_library.PatchTST",
+        "--model-name", f"time_series_library.{model}",
         "--model-hyper-params", json.dumps(params),
         "--gpus", str(args.gpu),
         "--num-workers", "1",
         "--timeout", "60000",
-        "--save-path", save_path(dataset, loss_name, horizon),
+        "--save-path", save_path(dataset, model, loss_name, horizon),
     ]
     if args.seed is not None:
         cmd += ["--seed", str(args.seed)]
-    print(f"\n===== {loss_name} | {dataset} | horizon={horizon} =====", flush=True)
+    print(f"\n===== {loss_name} | {dataset} | {model} | horizon={horizon} =====", flush=True)
     subprocess.run(cmd, cwd=ROOT, check=False)
 
 
-def read_result(dataset, loss_name, horizon):
-    pattern = os.path.join(ROOT, "result", save_path(dataset, loss_name, horizon), "test_report*.csv")
+def read_result(dataset, model, loss_name, horizon):
+    pattern = os.path.join(ROOT, "result", save_path(dataset, model, loss_name, horizon), "test_report*.csv")
     files = sorted(glob.glob(pattern), key=os.path.getmtime)
     if not files:
         return None
@@ -133,10 +151,10 @@ def read_result(dataset, loss_name, horizon):
     return out
 
 
-def build_table(dataset, horizons, losses):
+def build_table(dataset, model, horizons, losses):
     rows = []
     for h in horizons:
-        res = {l: read_result(dataset, l, h) for l in losses}
+        res = {l: read_result(dataset, model, l, h) for l in losses}
         for m in METRICS:
             row = {"horizon": str(h), "metric": m.replace("_norm", "").upper()}
             for l in losses:
@@ -166,11 +184,12 @@ def build_table(dataset, horizons, losses):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="ETTh1")
-    p.add_argument("--horizons", type=int, nargs="+", default=[96])
+    p.add_argument("--model", default="PatchTST", choices=["PatchTST", "DLinear", "iTransformer"])
+    p.add_argument("--horizons", type=int, nargs="+", default=[96, 192, 336])
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_val"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_ST"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)
@@ -183,15 +202,16 @@ def main():
     if not args.report_only:
         for h in args.horizons:
             for l in args.losses:
-                if l == "DBLoss" and not args.force and read_result(args.dataset, l, h) is not None:
-                    print(f"\n===== Skipping {l} | {args.dataset} | horizon={h} (already exists) =====", flush=True)
+                if l == "DBLoss" and not args.force and read_result(args.dataset, args.model, l, h) is not None:
+                    print(f"\n===== Skipping {l} | {args.dataset} | {args.model} | horizon={h} (already exists) =====", flush=True)
                     continue
-                run_one(args.dataset, l, h, args)
+                run_one(args.dataset, args.model, l, h, args)
 
-    table = build_table(args.dataset, args.horizons, args.losses)
+    table = build_table(args.dataset, args.model, args.horizons, args.losses)
     pd.set_option("display.width", 200)
     print("\n" + table.to_string(index=False, float_format=lambda v: f"{v:.6f}"))
-    out_csv = os.path.join(ROOT, "result", f"compare_{args.dataset}.csv")
+    suffix = f"{args.dataset}" if args.model == "PatchTST" else f"{args.dataset}_{args.model}"
+    out_csv = os.path.join(ROOT, "result", f"compare_{suffix}.csv")
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     table.to_csv(out_csv, index=False)
     print(f"\nSaved: {out_csv}")

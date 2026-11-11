@@ -21,13 +21,12 @@ class EMA(nn.Module):
         super(EMA, self).__init__()
         self.alpha = alpha
 
-    def forward(self, x, alpha_override=None):
+    def forward(self, x):
         _, t, _ = x.shape
-        a = self.alpha if alpha_override is None else float(alpha_override)
         powers = torch.flip(torch.arange(t, dtype=torch.double), dims=(0,))
-        weights = torch.pow((1 - a), powers).to(x.device)
+        weights = torch.pow((1 - self.alpha), powers).to(x.device)
         divisor = weights.clone()
-        weights[1:] = weights[1:] * a
+        weights[1:] = weights[1:] * self.alpha
         weights = weights.reshape(1, t, 1)
         divisor = divisor.reshape(1, t, 1)
         x = torch.cumsum(x * weights, dim=1)
@@ -44,8 +43,8 @@ class DECOMP(nn.Module):
         super(DECOMP, self).__init__()
         self.ma = EMA(alpha)
 
-    def forward(self, x, alpha_override=None):
-        moving_average = self.ma(x, alpha_override=alpha_override)
+    def forward(self, x):
+        moving_average = self.ma(x)
         res = x - moving_average
         return res, moving_average
 
@@ -72,135 +71,73 @@ class DBLoss(nn.Module):
 
 class HD_DBLoss(nn.Module):
     """
-    Horizon-Adaptive Heteroscedastic Decomposition-Based Loss (HD-DBLoss)
-    Adapts decomposition smoothing, branch balance, and heteroscedastic decay to horizon H:
-      1. gamma(H):
-         - 'mixture' (Two-Regime Horizon Mixture Law, default):
-             gamma(H) = gamma - kappa_gamma * (1 - H_ref / H)
-           Derives from the exact proportion of short-term steps (H_ref / H) vs
-           long-term steps (1 - H_ref / H) in a forecast window of length H.
-         - 'log':
-             gamma(H) = gamma - kappa_gamma * ln(H / H_ref)
-      2. alpha(H) = alpha * (H_ref / H) ** eta_alpha
-      3. beta(H) = clip(beta + kappa_beta * ln(H / H_ref), 0.05, 0.95)
+    Heteroscedastic Decomposition-Based Loss with Step-wise Empirical Variance Weighting.
+    Measures step-wise error variance directly from training batches via EMA buffers
+    (running_var_s, running_var_t) without any horizon-dependent heuristics:
+      - Seasonal branch (gamma_S > 0): inverse-variance weighting w_s = running_var_s ** (-gamma_S)
+      - Trend branch (gamma_T >= 0): trajectory weighting w_t = running_var_t ** (+gamma_T)
     """
 
     def __init__(
         self,
         alpha=0.2,
         beta=0.5,
-        gamma=1.15,
-        gamma_season=1.15,
-        tau=4.0,
-        h_ref=96.0,
-        kappa_gamma=1.75,
-        eta_alpha=0.35,
-        kappa_beta=0.25,
-        gamma_mode="mixture",
-        val_unweighted=False,
-        h0=0.0,
-        trend_loss_type="mae",
-        align_scale=True,
-        learnable_gamma=False,
-        lambda_reg=0.1,
-        lambda_trend=1.0,
-        lambda_season=1.0,
+        gamma_S=0.5,
+        gamma_T=0.0,
+        momentum=0.95,
     ):
         super().__init__()
         self.decomp = DECOMP(alpha)
-        self.alpha_init = float(alpha)
-        self.beta_init = float(beta)
-        self.gamma_init = float(gamma)
-        self.gamma_season_init = float(gamma_season)
-        self.tau = float(tau)
-        self.h_ref = float(h_ref)
-        self.kappa_gamma = float(kappa_gamma)
-        self.eta_alpha = float(eta_alpha)
-        self.kappa_beta = float(kappa_beta)
-        self.gamma_mode = str(gamma_mode).lower()
-        self.val_unweighted = bool(val_unweighted)
-        self.h0 = float(h0)
-        self.trend_loss_type = str(trend_loss_type).lower()
-        self.align_scale = bool(align_scale)
-        self.learnable_gamma = bool(learnable_gamma)
-        self.lambda_reg = float(lambda_reg)
-        self.lambda_trend = float(lambda_trend)
-        self.lambda_season = float(lambda_season)
-
-        if self.learnable_gamma:
-            self.gamma_raw = nn.Parameter(torch.tensor(float(gamma), dtype=torch.float32))
-        else:
-            self.register_parameter("gamma_raw", None)
-
-    def _horizon_params(self, H_steps: int):
-        """Compute horizon-dependent (alpha_H, beta_H, gamma_T_H, gamma_S_H) from H_steps."""
-        ratio = max(float(H_steps) / max(self.h_ref, 1.0), 1e-4)
-        log_r = float(np.log(ratio))
-        mix_r = 1.0 - (1.0 / ratio)  # 1 - H_ref / H: fraction of long-term steps in [0, 1)
-
-        # 1. EMA smoothing alpha(H): wider smoothing window for longer horizons
-        alpha_H = self.alpha_init * (ratio ** (-self.eta_alpha))
-        alpha_H = float(np.clip(alpha_H, 0.02, 0.95))
-
-        # 2. Branch balance beta(H)
-        beta_H = float(np.clip(self.beta_init + self.kappa_beta * log_r, 0.05, 0.95))
-
-        # 3. Heteroscedastic decay exponent gamma(H)
-        r_gamma = mix_r if self.gamma_mode == "mixture" else log_r
-        gamma_T_H = self.gamma_init - self.kappa_gamma * r_gamma
-        gamma_S_H = self.gamma_season_init - self.kappa_gamma * r_gamma
-        return alpha_H, beta_H, gamma_T_H, gamma_S_H
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.gamma_S = float(gamma_S)
+        self.gamma_T = float(gamma_T)
+        self.momentum = float(momentum)
+        self.register_buffer("running_var_s", None)
+        self.register_buffer("running_var_t", None)
 
     def forward(self, pred, target):
+        _, H, _ = pred.shape
         device = pred.device
         dtype = pred.dtype
-        _, H_steps, _ = pred.shape
 
-        alpha_H, beta_H, gamma_T_H, gamma_S_H = self._horizon_params(H_steps)
+        # 1. Decompose by EMA exactly like original DBLoss
+        s_pred, t_pred = self.decomp(pred)
+        s_true, t_true = self.decomp(target)
 
-        # 1. Horizon-adapted EMA Decomposition
-        pred_season, pred_trend = self.decomp(pred, alpha_override=alpha_H)
-        target_season, target_trend = self.decomp(target, alpha_override=alpha_H)
+        err_season = (s_pred - s_true) ** 2          # [B, H, C]
+        err_trend = torch.abs(t_pred - t_true)       # [B, H, C]
 
-        # 2. Pointwise Seasonal (MSE) and Trend (MAE/MSE) errors [Batch, H, Channels]
-        season_err = (pred_season - target_season) ** 2
-        if self.trend_loss_type == "mse":
-            trend_err = (pred_trend - target_trend) ** 2
-        else:
-            trend_err = torch.abs(pred_trend - target_trend)
+        # Lazily initialize EMA buffers of length H to 1.0
+        if self.running_var_s is None or self.running_var_s.shape[0] != H:
+            self.running_var_s = torch.ones(H, device=device, dtype=dtype)
+            self.running_var_t = torch.ones(H, device=device, dtype=dtype)
 
-        # Validation / EarlyStopping evaluation alignment (fixes DBLoss validation blindspot)
-        if self.val_unweighted and not torch.is_grad_enabled():
-            mse_val = torch.mean((pred - target) ** 2)
-            mae_val = torch.mean(torch.abs(pred - target))
-            return 0.5 * mse_val + 0.5 * mae_val
+        # 2. Update step-wise empirical variance during training batches
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                batch_var_s = err_season.detach().mean(dim=(0, 2))  # [H]
+                batch_var_t = err_trend.detach().mean(dim=(0, 2))   # [H]
+                m = self.momentum
+                self.running_var_s = m * self.running_var_s + (1.0 - m) * (
+                    batch_var_s / (batch_var_s.mean() + 1e-8)
+                )
+                self.running_var_t = m * self.running_var_t + (1.0 - m) * (
+                    batch_var_t / (batch_var_t.mean() + 1e-8)
+                )
 
-        # 3. Normalized heteroscedastic weights w_h(H) across horizon [1, H, 1]
-        h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)
-        denom = max(H_steps - 1, 1)
-        s_h = 1.0 + self.tau * ((h - 1.0) / denom) if self.tau > 0 else (h + self.h0)
+        # 3. Compute normalized step-wise weights w_s and w_t from empirical variance
+        w_s = (self.running_var_s + 1e-8) ** (-self.gamma_S)
+        w_s = (w_s / (w_s.mean() + 1e-8)).view(1, H, 1)
 
-        if abs(gamma_S_H) > 1e-6:
-            w_s_tilde = torch.pow(s_h, -gamma_S_H)
-            w_s = w_s_tilde / (torch.mean(w_s_tilde) + 1e-8)
-            season_loss = torch.mean(season_err * w_s)
-        else:
-            season_loss = torch.mean(season_err)
+        w_t = (self.running_var_t + 1e-8) ** (self.gamma_T)
+        w_t = (w_t / (w_t.mean() + 1e-8)).view(1, H, 1)
 
-        gamma_val = self.gamma_raw if self.learnable_gamma else gamma_T_H
-        if self.learnable_gamma or abs(gamma_T_H) > 1e-6:
-            w_tilde = torch.pow(s_h, -gamma_val)
-            w = w_tilde / (torch.mean(w_tilde) + 1e-8)
-            trend_loss = torch.mean(trend_err * w)
-        else:
-            trend_loss = torch.mean(trend_err)
-
-        # 4. Dynamic scale alignment (identical to DBLoss)
-        if self.align_scale:
-            trend_loss = trend_loss * (season_loss / (trend_loss + 1e-8)).detach()
-            return beta_H * season_loss + (1.0 - beta_H) * trend_loss
-
-        return self.lambda_trend * trend_loss + self.lambda_season * season_loss
+        # 4. Compute weighted losses and align gradient scale as in DBLoss
+        loss_season = (w_s * err_season).mean()
+        loss_trend = (w_t * err_trend).mean()
+        loss_trend = loss_trend * (loss_season / (loss_trend + 1e-8)).detach()
+        return self.beta * loss_season + (1.0 - self.beta) * loss_trend
 
 
 def adjust_learning_rate(optimizer, epoch, args):

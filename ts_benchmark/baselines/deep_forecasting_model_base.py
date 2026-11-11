@@ -39,23 +39,10 @@ DEFAULT_HYPER_PARAMS = {
     "parallel_strategy": None,
     "alpha": 0.2,
     "beta": 0.5,
-    # HD_DBLoss hyper parameters (Horizon-Adaptive v3)
-    "gamma": 1.15,
-    "gamma_season": 1.15,
-    "tau": 4.0,
-    "h_ref": 96.0,
-    "kappa_gamma": 1.75,
-    "eta_alpha": 0.35,
-    "kappa_beta": 0.25,
-    "gamma_mode": "mixture",
-    "val_unweighted": False,
-    "h0": 0.0,
-    "trend_loss_type": "mae",
-    "align_scale": True,
-    "learnable_gamma": False,
-    "lambda_reg": 0.1,
-    "lambda_trend": 1.0,
-    "lambda_season": 1.0,
+    # HD_DBLoss hyper parameters (Step-wise Empirical Variance Weighting)
+    "gamma_S": 0.5,
+    "gamma_T": 0.0,
+    "momentum": 0.95,
 }
 
 
@@ -157,22 +144,9 @@ class DeepForecastingModelBase(ModelBase):
             criterion = HD_DBLoss(
                 alpha=self.config.alpha,
                 beta=self.config.beta,
-                gamma=self.config.gamma,
-                gamma_season=self.config.gamma_season,
-                tau=self.config.tau,
-                h_ref=self.config.h_ref,
-                kappa_gamma=self.config.kappa_gamma,
-                eta_alpha=self.config.eta_alpha,
-                kappa_beta=self.config.kappa_beta,
-                gamma_mode=self.config.gamma_mode,
-                val_unweighted=self.config.val_unweighted,
-                h0=self.config.h0,
-                trend_loss_type=self.config.trend_loss_type,
-                align_scale=self.config.align_scale,
-                learnable_gamma=bool(self.config.learnable_gamma),
-                lambda_reg=self.config.lambda_reg,
-                lambda_trend=self.config.lambda_trend,
-                lambda_season=self.config.lambda_season,
+                gamma_S=self.config.gamma_S,
+                gamma_T=self.config.gamma_T,
+                momentum=self.config.momentum,
             )
         else:
             criterion = nn.HuberLoss(delta=0.5)
@@ -372,6 +346,7 @@ class DeepForecastingModelBase(ModelBase):
         config = self.config
         total_loss = []
         self.model.eval()
+        criterion.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         with torch.no_grad():
             for input, target, input_mark, target_mark in valid_data_loader:
@@ -396,6 +371,7 @@ class DeepForecastingModelBase(ModelBase):
 
         total_loss = np.mean(total_loss)
         self.model.train()
+        criterion.train()
         return total_loss
 
     def forecast_fit(
@@ -495,8 +471,7 @@ class DeepForecastingModelBase(ModelBase):
 
         for epoch in range(config.num_epochs):
             self.model.train()
-            if hasattr(criterion, "set_epoch"):
-                criterion.set_epoch(epoch, config.num_epochs)
+            criterion.train()
             # for input, target, input_mark, target_mark in train_data_loader:
             for i, (input, target, input_mark, target_mark) in enumerate(
                 self.train_data_loader
