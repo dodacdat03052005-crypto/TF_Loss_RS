@@ -72,24 +72,28 @@ class DBLoss(nn.Module):
 class HD_DBLoss(nn.Module):
     """
     Heteroscedastic Decomposition-Based Loss (HD-DBLoss)
-    - Seasonal: Stationary I(0) -> uniform MSE across horizon steps.
-    - Trend: Non-stationary I(d) -> heteroscedastic MLE weighting across horizon steps h = 1..H
-      with base-variance scaling s_h = 1 + tau * (h - 1)/(H - 1) (or shifted index h + h0),
-      optional cosine gamma annealing, and dynamic scale alignment with seasonal loss.
+    1. Bidirectional / Zero-phase EMA option (bi_weight) to eliminate phase lag and S_1 = 0 blind spot.
+    2. Horizon-Heteroscedastic Charbonnier potential: sqrt(e^2 + (delta0 * s_h^gamma)^2) - delta0 * s_h^gamma
+       whose non-linear per-sample gradient saturation varies across horizon h and is NOT canceled by Adam.
+    3. I(1) -> I(0) First-Difference Trend Velocity loss (diff_weight) coupling adjacent steps (h-1, h).
+    4. Dynamic scale alignment matching DBLoss magnitude balancing.
     """
 
     def __init__(
         self,
         alpha=0.2,
         beta=0.5,
-        gamma=0.3,
-        gamma_min=0.05,
-        tau=1.5,
+        gamma=0.6,
+        gamma_min=0.1,
+        tau=3.0,
         h0=0.0,
-        trend_loss_type="mae",
+        delta0=0.05,
+        diff_weight=0.25,
+        bi_weight=0.3,
+        trend_loss_type="charbonnier",
         align_scale=True,
-        gamma_anneal=True,
-        eval_uniform=True,
+        gamma_anneal=False,
+        eval_uniform=False,
         learnable_gamma=False,
         lambda_reg=0.1,
         lambda_trend=1.0,
@@ -103,6 +107,9 @@ class HD_DBLoss(nn.Module):
         self.current_gamma = float(gamma)
         self.tau = float(tau)
         self.h0 = float(h0)
+        self.delta0 = float(delta0)
+        self.diff_weight = float(diff_weight)
+        self.bi_weight = float(bi_weight)
         self.trend_loss_type = str(trend_loss_type).lower()
         self.align_scale = bool(align_scale)
         self.gamma_anneal = bool(gamma_anneal)
@@ -113,7 +120,6 @@ class HD_DBLoss(nn.Module):
         self.lambda_season = float(lambda_season)
 
         if self.learnable_gamma:
-            # Parameterize via inverse softplus so gamma = softplus(gamma_raw) > 0
             init_val = max(self.gamma_init, 1e-3)
             raw_init = float(np.log(np.expm1(init_val)))
             self.gamma_raw = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
@@ -129,56 +135,85 @@ class HD_DBLoss(nn.Module):
         else:
             self.current_gamma = self.gamma_init
 
-    def _compute_trend_error(self, pred_trend, target_trend):
-        if self.trend_loss_type == "mae":
-            return torch.abs(pred_trend - target_trend)
+    def _decompose(self, x):
+        season_f, trend_f = self.decomp(x)
+        if self.bi_weight > 0.0:
+            x_rev = torch.flip(x, dims=[1])
+            _, trend_b = self.decomp(x_rev)
+            trend_b = torch.flip(trend_b, dims=[1])
+            trend = (1.0 - self.bi_weight) * trend_f + self.bi_weight * trend_b
+            season = x - trend
+            return season, trend
+        return season_f, trend_f
+
+    def _compute_trend_error(self, pred_trend, target_trend, s_h, gamma_val):
+        diff = pred_trend - target_trend
+        if self.trend_loss_type == "charbonnier" and self.delta0 > 0.0:
+            # Horizon-growing scale delta_h = delta0 * s_h^gamma inside the square root
+            delta_h = self.delta0 * torch.pow(s_h, gamma_val)
+            return torch.sqrt(diff * diff + delta_h * delta_h) - delta_h
+        elif self.trend_loss_type == "mae" or (self.trend_loss_type == "charbonnier" and self.delta0 <= 0.0):
+            return torch.abs(diff)
         elif self.trend_loss_type == "huber":
             return torch.nn.functional.smooth_l1_loss(
                 pred_trend, target_trend, reduction="none", beta=0.5
             )
         else:  # "mse"
-            return (pred_trend - target_trend) ** 2
+            return diff * diff
 
     def forward(self, pred, target):
         device = pred.device
         dtype = pred.dtype
         _, H_steps, _ = pred.shape
 
-        # 1. Decompose into seasonal and trend components
-        pred_season, pred_trend = self.decomp(pred)
-        target_season, target_trend = self.decomp(target)
+        # 1. Decompose into seasonal and trend components (with optional zero-phase bidirectional EMA)
+        pred_season, pred_trend = self._decompose(pred)
+        target_season, target_trend = self._decompose(target)
 
-        # 2. Seasonal loss (stationary I(0) -> uniform MSE)
+        # 2. Seasonal loss (stationary I(0) -> uniform MSE + optional L1 frequency sharpness)
         season_loss = torch.mean((pred_season - target_season) ** 2)
 
-        # 3. Pointwise trend error [Batch, H, Channels]
-        trend_err = self._compute_trend_error(pred_trend, target_trend)
-
-        # During validation (no grad), optionally evaluate with uniform horizon weights
-        # to avoid the Evaluation / Early-Stopping Trap
-        if self.eval_uniform and not torch.is_grad_enabled():
-            trend_loss = torch.mean(trend_err)
+        # 3. Variance scaling profile s_h across horizon [1, H, 1]
+        h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)
+        if self.tau > 0:
+            denom = max(H_steps - 1, 1)
+            s_h = 1.0 + self.tau * ((h - 1.0) / denom)
         else:
-            # 4. Variance scaling profile s_h across horizon [1, H, 1]
-            h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)
-            if self.tau > 0:
-                denom = max(H_steps - 1, 1)
-                s_h = 1.0 + self.tau * ((h - 1.0) / denom)
-            else:
-                s_h = h + self.h0
+            s_h = h + self.h0
 
-            if self.learnable_gamma:
-                gamma_val = torch.nn.functional.softplus(self.gamma_raw)
-                w_tilde = torch.pow(s_h, -gamma_val)
-                w = w_tilde / (torch.mean(w_tilde) + 1e-8)
-                reg_term = self.lambda_reg * gamma_val * torch.mean(torch.log(s_h))
-                trend_loss = torch.mean(trend_err * w) + reg_term
-            else:
-                w_tilde = torch.pow(s_h, -self.current_gamma)
-                w = w_tilde / (torch.mean(w_tilde) + 1e-8)
-                trend_loss = torch.mean(trend_err * w)
+        gamma_val = (
+            torch.nn.functional.softplus(self.gamma_raw)
+            if self.learnable_gamma
+            else self.current_gamma
+        )
 
-        # 5. Dynamic scale alignment (matches DBLoss magnitude balancing)
+        # 4. Pointwise heteroscedastic trend error [Batch, H, Channels]
+        trend_err = self._compute_trend_error(pred_trend, target_trend, s_h, gamma_val)
+
+        if self.eval_uniform and not torch.is_grad_enabled():
+            trend_level_loss = torch.mean(trend_err)
+        else:
+            w_tilde = torch.pow(s_h, -gamma_val)
+            w = w_tilde / (torch.mean(w_tilde) + 1e-8)
+            trend_level_loss = torch.mean(trend_err * w)
+            if self.learnable_gamma and torch.is_grad_enabled():
+                trend_level_loss = trend_level_loss + self.lambda_reg * gamma_val * torch.mean(
+                    torch.log(s_h)
+                )
+
+        # 5. I(1) -> I(0) First-Difference Trend Velocity Loss (couples step h-1 and h, immune to Adam cancellation)
+        if self.diff_weight > 0.0 and H_steps > 1:
+            pred_vel = pred_trend[:, 1:, :] - pred_trend[:, :-1, :]
+            target_vel = target_trend[:, 1:, :] - target_trend[:, :-1, :]
+            vel_err = torch.abs(pred_vel - target_vel)
+            # Align velocity magnitude with level loss magnitude
+            vel_loss = torch.mean(vel_err)
+            vel_loss = vel_loss * (trend_level_loss / (vel_loss + 1e-8)).detach()
+            trend_loss = (1.0 - self.diff_weight) * trend_level_loss + self.diff_weight * vel_loss
+        else:
+            trend_loss = trend_level_loss
+
+        # 6. Dynamic scale alignment (matches DBLoss magnitude balancing)
         if self.align_scale:
             trend_loss = trend_loss * (season_loss / (trend_loss + 1e-8)).detach()
             return self.beta * season_loss + (1.0 - self.beta) * trend_loss

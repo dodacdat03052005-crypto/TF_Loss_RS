@@ -31,44 +31,51 @@ LOSS_VARIANTS = {
     "DBLoss": {"loss": "DBLoss"},
     "HD_DBLoss": {
         "loss": "HD_DBLoss",
-        "gamma": 0.3,
-        "gamma_min": 0.05,
-        "tau": 1.5,
+        "gamma": 0.6,
+        "tau": 3.0,
+        "delta0": 0.05,
+        "diff_weight": 0.25,
+        "bi_weight": 0.3,
+        "trend_loss_type": "charbonnier",
+        "align_scale": True,
+        "gamma_anneal": False,
+        "eval_uniform": False,
+        "learnable_gamma": False,
+    },
+    "HD_DBLoss_diff": {
+        "loss": "HD_DBLoss",
+        "gamma": 0.6,
+        "tau": 3.0,
+        "delta0": 0.05,
+        "diff_weight": 0.3,
+        "bi_weight": 0.0,
+        "trend_loss_type": "charbonnier",
+        "align_scale": True,
+        "gamma_anneal": False,
+        "eval_uniform": False,
+    },
+    "HD_DBLoss_bi": {
+        "loss": "HD_DBLoss",
+        "gamma": 0.6,
+        "tau": 3.0,
+        "delta0": 0.0,
+        "diff_weight": 0.0,
+        "bi_weight": 0.35,
         "trend_loss_type": "mae",
         "align_scale": True,
-        "gamma_anneal": True,
-        "eval_uniform": True,
-        "learnable_gamma": False,
-    },
-    "HD_DBLoss_mse": {
-        "loss": "HD_DBLoss",
-        "gamma": 0.3,
-        "gamma_min": 0.05,
-        "tau": 1.5,
-        "trend_loss_type": "mse",
-        "align_scale": True,
-        "gamma_anneal": True,
-        "eval_uniform": True,
-        "learnable_gamma": False,
-    },
-    "HD_DBLoss_huber": {
-        "loss": "HD_DBLoss",
-        "gamma": 0.3,
-        "gamma_min": 0.05,
-        "tau": 1.5,
-        "trend_loss_type": "huber",
-        "align_scale": True,
-        "gamma_anneal": True,
-        "eval_uniform": True,
-        "learnable_gamma": False,
+        "gamma_anneal": False,
+        "eval_uniform": False,
     },
     "HD_DBLoss_learnable": {
         "loss": "HD_DBLoss",
-        "gamma": 0.3,
-        "tau": 1.5,
-        "trend_loss_type": "mae",
+        "gamma": 0.6,
+        "tau": 3.0,
+        "delta0": 0.05,
+        "diff_weight": 0.25,
+        "bi_weight": 0.3,
+        "trend_loss_type": "charbonnier",
         "align_scale": True,
-        "eval_uniform": True,
+        "eval_uniform": False,
         "learnable_gamma": True,
         "lambda_reg": 0.1,
     },
@@ -162,15 +169,24 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="ETTh1")
     p.add_argument("--horizons", type=int, nargs="+", default=[96])
-    p.add_argument("--losses", nargs="+", default=["DBLoss", "HD_DBLoss"], choices=list(LOSS_VARIANTS))
+    p.add_argument(
+        "--losses",
+        nargs="+",
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_diff", "HD_DBLoss_bi"],
+        choices=list(LOSS_VARIANTS),
+    )
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--report-only", action="store_true")
+    p.add_argument("--force", action="store_true", help="Re-run DBLoss even if cached result exists")
     args = p.parse_args()
 
     if not args.report_only:
         for h in args.horizons:
             for l in args.losses:
+                if l == "DBLoss" and not args.force and read_result(args.dataset, l, h) is not None:
+                    print(f"\n===== Skipping {l} | {args.dataset} | horizon={h} (already exists) =====", flush=True)
+                    continue
                 run_one(args.dataset, l, h, args)
 
     table = build_table(args.dataset, args.horizons, args.losses)
