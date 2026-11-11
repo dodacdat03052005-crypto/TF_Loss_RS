@@ -39,9 +39,13 @@ DEFAULT_HYPER_PARAMS = {
     "parallel_strategy": None,
     "alpha": 0.2,
     "beta": 0.5,
-    # HD_DBLoss hyper parameters (Clean v2)
-    "gamma": 0.4,
-    "gamma_season": 0.4,
+    # HD_DBLoss hyper parameters
+    "mode": "tf",
+    "freq_weight": 0.35,
+    "patch_weight": 0.4,
+    "instance_align": False,
+    "gamma": 0.0,
+    "gamma_season": 0.0,
     "gamma_min": 0.0,
     "anneal_decay": 0.3,
     "tau": 2.0,
@@ -155,6 +159,10 @@ class DeepForecastingModelBase(ModelBase):
             criterion = HD_DBLoss(
                 alpha=self.config.alpha,
                 beta=self.config.beta,
+                mode=self.config.mode,
+                freq_weight=self.config.freq_weight,
+                patch_weight=self.config.patch_weight,
+                instance_align=self.config.instance_align,
                 gamma=self.config.gamma,
                 gamma_season=self.config.gamma_season,
                 gamma_min=self.config.gamma_min,

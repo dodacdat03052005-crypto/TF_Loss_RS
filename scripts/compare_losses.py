@@ -26,11 +26,23 @@ ETTH1_PATCHTST = {
     720: {"batch_size": 64, "d_ff": 512, "d_model": 128, "lr": 0.0001, "norm": True, "seq_len": 512},
 }
 
-# Loss variants to compare: name -> extra hyper params (Clean v2 variants)
+# Loss variants to compare: name -> extra hyper params
 LOSS_VARIANTS = {
     "DBLoss": {"loss": "DBLoss"},
+    "TF_DBLoss": {
+        "loss": "HD_DBLoss",
+        "mode": "tf",
+        "freq_weight": 0.35,
+        "patch_weight": 0.4,
+    },
+    "IC_DBLoss": {
+        "loss": "HD_DBLoss",
+        "mode": "ic",
+        "freq_weight": 0.25,
+    },
     "HD_DBLoss": {
         "loss": "HD_DBLoss",
+        "mode": "v2",
         "gamma": 0.4,
         "gamma_season": 0.4,
         "tau": 2.0,
@@ -38,40 +50,6 @@ LOSS_VARIANTS = {
         "align_scale": True,
         "gamma_anneal": False,
         "eval_uniform": False,
-        "learnable_gamma": False,
-    },
-    "HD_DBLoss_strong": {
-        "loss": "HD_DBLoss",
-        "gamma": 0.6,
-        "gamma_season": 0.6,
-        "tau": 3.0,
-        "trend_loss_type": "mae",
-        "align_scale": True,
-        "gamma_anneal": False,
-        "eval_uniform": False,
-        "learnable_gamma": False,
-    },
-    "HD_DBLoss_fixed": {
-        "loss": "HD_DBLoss",
-        "gamma": 0.4,
-        "gamma_season": 0.4,
-        "tau": 2.0,
-        "trend_loss_type": "mae",
-        "align_scale": True,
-        "gamma_anneal": False,
-        "eval_uniform": False,
-        "learnable_gamma": False,
-    },
-    "HD_DBLoss_learnable": {
-        "loss": "HD_DBLoss",
-        "gamma": 0.4,
-        "gamma_season": 0.4,
-        "tau": 2.0,
-        "trend_loss_type": "mae",
-        "align_scale": True,
-        "eval_uniform": False,
-        "learnable_gamma": True,
-        "lambda_reg": 0.1,
     },
 }
 
@@ -180,7 +158,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_strong"],
+        default=["DBLoss", "TF_DBLoss", "IC_DBLoss"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--gpu", type=int, default=0)

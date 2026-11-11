@@ -71,20 +71,29 @@ class DBLoss(nn.Module):
 
 class HD_DBLoss(nn.Module):
     """
-    Heteroscedastic Decomposition-Based Loss (HD-DBLoss - Clean v2 Formulation)
-    - Keeps DBLoss decomposition (EMA), Seasonal MSE, Trend MAE, and dynamic scale alignment intact.
-    - Applies normalized heteroscedastic horizon weights w_h = s_h^(-gamma) / mean(s_h^(-gamma))
-      where s_h = 1 + tau * (h - 1) / (H - 1).
-    - Supports exponential gamma annealing synchronized with learning rate decay:
-      gamma(epoch) = gamma_min + (gamma - gamma_min) * (anneal_decay ** epoch).
+    Time-Frequency & Multi-Scale Decomposition-Based Loss (HD-DBLoss / TF-DBLoss)
+    Solves the SNR paradox of pointwise horizon reweighting:
+    - Pointwise weighting w_h * e_h scales BOTH signal and noise by w_h (leaving SNR unchanged
+      while starving far horizons H=192, 336 of gradient).
+    - Instead, we increase far-horizon SNR without attenuating far steps:
+      1. Seasonal branch (Fourier Domain Sparsity): combines time-domain MSE with frequency-domain
+         L1 spectral loss ||rFFT(S_pred) - rFFT(S_true)||_1, concentrating periodic energy across
+         the whole horizon H while averaging out unstructured step noise.
+      2. Trend branch (Multi-Scale Patch Pooling + Instance-wise Alignment): combines pointwise MAE
+         with multi-scale average-pooled trend MAE (dividing random-walk noise variance by patch size P
+         while keeping 100% of the long-range trend level).
     """
 
     def __init__(
         self,
         alpha=0.2,
         beta=0.5,
-        gamma=0.4,
-        gamma_season=0.4,
+        mode="tf",
+        freq_weight=0.35,
+        patch_weight=0.4,
+        instance_align=False,
+        gamma=0.0,
+        gamma_season=0.0,
         gamma_min=0.0,
         anneal_decay=0.3,
         tau=2.0,
@@ -100,7 +109,12 @@ class HD_DBLoss(nn.Module):
     ):
         super().__init__()
         self.decomp = DECOMP(alpha)
+        self.decomp_slow = DECOMP(alpha * 0.5)
         self.beta = float(beta)
+        self.mode = str(mode).lower()
+        self.freq_weight = float(freq_weight)
+        self.patch_weight = float(patch_weight)
+        self.instance_align = bool(instance_align)
         self.gamma_init = float(gamma)
         self.gamma_season_init = float(gamma_season)
         self.gamma_min = float(gamma_min)
@@ -126,11 +140,6 @@ class HD_DBLoss(nn.Module):
             self.register_parameter("gamma_raw", None)
 
     def set_epoch(self, epoch: int, num_epochs: int):
-        """
-        Exponential annealing synchronized with lradj='type1' (where lr halves every epoch).
-        Epoch 0 uses full gamma to suppress far-horizon noise; subsequent epochs rapidly
-        relax toward uniform weighting so fine-tuning preserves full horizon amplitude.
-        """
         if self.gamma_anneal and not self.learnable_gamma:
             factor = float(self.anneal_decay ** epoch)
             self.current_gamma = self.gamma_min + (self.gamma_init - self.gamma_min) * factor
@@ -139,36 +148,92 @@ class HD_DBLoss(nn.Module):
             self.current_gamma = self.gamma_init
             self.current_gamma_season = self.gamma_season_init
 
+    def _multi_scale_trend_loss(self, pred_trend, target_trend):
+        """Pointwise MAE + Multi-scale pooled MAE (reduces noise variance by 1/k while preserving signal)."""
+        point_loss = torch.mean(torch.abs(pred_trend - target_trend))
+        if self.patch_weight <= 0.0:
+            return point_loss
+
+        # Transpose to [Batch, Channels, H] for 1D average pooling across horizon
+        p_t = pred_trend.permute(0, 2, 1)
+        t_t = target_trend.permute(0, 2, 1)
+        H_steps = p_t.shape[-1]
+
+        pool_losses = []
+        for k in (4, 8, 16):
+            if H_steps >= k:
+                p_pool = torch.nn.functional.avg_pool1d(p_t, kernel_size=k, stride=k // 2)
+                t_pool = torch.nn.functional.avg_pool1d(t_t, kernel_size=k, stride=k // 2)
+                l_k = torch.mean(torch.abs(p_pool - t_pool))
+                l_k = l_k * (point_loss / (l_k + 1e-8)).detach()
+                pool_losses.append(l_k)
+
+        if not pool_losses:
+            return point_loss
+        ms_loss = sum(pool_losses) / len(pool_losses)
+        return (1.0 - self.patch_weight) * point_loss + self.patch_weight * ms_loss
+
+    def _spectral_season_loss(self, pred_season, target_season):
+        """Time-domain MSE + Frequency-domain rFFT L1 amplitude/complex loss."""
+        time_loss = torch.mean((pred_season - target_season) ** 2)
+        if self.freq_weight <= 0.0:
+            return time_loss
+
+        # rFFT along horizon dimension (dim=1)
+        pred_fft = torch.fft.rfft(pred_season.float(), dim=1, norm="ortho")
+        target_fft = torch.fft.rfft(target_season.float(), dim=1, norm="ortho")
+        # Complex difference L1 + Magnitude L1
+        freq_diff = torch.abs(pred_fft - target_fft)
+        mag_diff = torch.abs(torch.abs(pred_fft) - torch.abs(target_fft))
+        freq_loss = 0.5 * torch.mean(freq_diff) + 0.5 * torch.mean(mag_diff)
+        freq_loss = freq_loss * (time_loss / (freq_loss + 1e-8)).detach()
+        return (1.0 - self.freq_weight) * time_loss + self.freq_weight * freq_loss
+
     def forward(self, pred, target):
         device = pred.device
         dtype = pred.dtype
         _, H_steps, _ = pred.shape
 
-        # 1. Standard EMA Decomposition (identical to DBLoss)
+        # 1. Standard EMA Decomposition
         pred_season, pred_trend = self.decomp(pred)
         target_season, target_trend = self.decomp(target)
 
-        # 2. Pointwise Seasonal (MSE) and Trend (MAE/MSE) errors [Batch, H, Channels]
-        season_err = (pred_season - target_season) ** 2
-        if self.trend_loss_type == "mse":
-            trend_err = (pred_trend - target_trend) ** 2
-        else:
-            trend_err = torch.abs(pred_trend - target_trend)
+        if self.mode == "tf":
+            # Time-Frequency + Multi-Scale SNR-Boosting Decomposition Loss
+            season_loss = self._spectral_season_loss(pred_season, target_season)
+            trend_loss = self._multi_scale_trend_loss(pred_trend, target_trend)
+            trend_loss = trend_loss * (season_loss / (trend_loss + 1e-8)).detach()
+            return self.beta * season_loss + (1.0 - self.beta) * trend_loss
 
-        # 3. Validation uses uniform horizon weights to prevent Early-Stopping bias
+        if self.mode == "ic":
+            # Instance-Channel Heteroscedastic Scale Alignment [Batch, Channels]
+            # Each series (b, c) balances its own seasonal vs trend variance before batch reduction
+            s_err = torch.mean((pred_season - target_season) ** 2, dim=1)  # [B, C]
+            t_err = torch.mean(torch.abs(pred_trend - target_trend), dim=1)  # [B, C]
+            t_aligned = t_err * (s_err / (t_err + 1e-8)).detach()
+            ic_loss = torch.mean(self.beta * s_err + (1.0 - self.beta) * t_aligned)
+            if self.freq_weight > 0.0:
+                sp_loss = self._spectral_season_loss(pred_season, target_season)
+                sp_loss = sp_loss * (ic_loss / (sp_loss + 1e-8)).detach()
+                return (1.0 - self.freq_weight) * ic_loss + self.freq_weight * sp_loss
+            return ic_loss
+
+        # Fallback: v2 pointwise horizon weighting
+        season_err = (pred_season - target_season) ** 2
+        trend_err = (
+            (pred_trend - target_trend) ** 2
+            if self.trend_loss_type == "mse"
+            else torch.abs(pred_trend - target_trend)
+        )
+
         if self.eval_uniform and not torch.is_grad_enabled():
             season_loss = torch.mean(season_err)
             trend_loss = torch.mean(trend_err)
         else:
-            # Variance profile s_h = 1 + tau * (h - 1)/(H - 1) across horizon [1, H, 1]
             h = torch.arange(1, H_steps + 1, device=device, dtype=dtype).view(1, H_steps, 1)
-            if self.tau > 0:
-                denom = max(H_steps - 1, 1)
-                s_h = 1.0 + self.tau * ((h - 1.0) / denom)
-            else:
-                s_h = h + self.h0
+            denom = max(H_steps - 1, 1)
+            s_h = 1.0 + self.tau * ((h - 1.0) / denom) if self.tau > 0 else (h + self.h0)
 
-            # Seasonal branch
             if self.current_gamma_season > 0.0:
                 w_s_tilde = torch.pow(s_h, -self.current_gamma_season)
                 w_s = w_s_tilde / (torch.mean(w_s_tilde) + 1e-8)
@@ -176,7 +241,6 @@ class HD_DBLoss(nn.Module):
             else:
                 season_loss = torch.mean(season_err)
 
-            # Trend branch
             gamma_val = (
                 torch.nn.functional.softplus(self.gamma_raw)
                 if self.learnable_gamma
@@ -186,10 +250,6 @@ class HD_DBLoss(nn.Module):
             w = w_tilde / (torch.mean(w_tilde) + 1e-8)
             trend_loss = torch.mean(trend_err * w)
 
-            if self.learnable_gamma and torch.is_grad_enabled():
-                trend_loss = trend_loss + self.lambda_reg * gamma_val * torch.mean(torch.log(s_h))
-
-        # 4. Dynamic scale alignment (identical to DBLoss)
         if self.align_scale:
             trend_loss = trend_loss * (season_loss / (trend_loss + 1e-8)).detach()
             return self.beta * season_loss + (1.0 - self.beta) * trend_loss
