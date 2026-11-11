@@ -53,7 +53,7 @@ BENCHMARK_CONFIGS = {
 }
 
 # Loss variants to compare (First-Principles Stationary Seasonal vs Non-Stationary Trend Precision Ratio):
-#   w_T(h) = (1 + c_step * (h - 1)) ** (-gamma),   w_S(h) = 1.0
+#   w_T(h) = w_min + (1 - w_min) * (1 + (c_step * (h - 1)) ** p_order) ** (-gamma),   w_S(h) = 1.0
 #   beta(h) = beta / (beta + (1 - beta) * w_T(h))  [Depends ONLY on step h, NEVER on horizon H!]
 LOSS_VARIANTS = {
     "MSE": {"loss": "MSE"},
@@ -64,6 +64,18 @@ LOSS_VARIANTS = {
         "beta": 0.5,
         "gamma": 1.0,
         "c_step": 0.015,
+        "p_order": 1.0,
+        "w_min": 0.0,
+        "step_decay": 0.0,
+    },
+    "HD_DBLoss_BW": {
+        "loss": "HD_DBLoss",
+        "alpha": 0.2,
+        "beta": 0.5,
+        "gamma": 1.0,
+        "c_step": 0.011,
+        "p_order": 2.0,
+        "w_min": 0.05,
         "step_decay": 0.0,
     },
     "HD_DBLoss_s2": {
@@ -72,6 +84,8 @@ LOSS_VARIANTS = {
         "beta": 0.5,
         "gamma": 1.2,
         "c_step": 0.020,
+        "p_order": 1.0,
+        "w_min": 0.0,
         "step_decay": 0.0,
     },
 }
@@ -233,7 +247,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_s2"],
+        default=["DBLoss", "HD_DBLoss", "HD_DBLoss_BW"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--batch-size", type=int, default=None, help="Override training batch_size (e.g. 128 or 256 for faster GPU runs)")
@@ -244,7 +258,7 @@ def main():
         help="Run every loss with several seeds (stored in seed-tagged paths) and report mean/std",
     )
     p.add_argument("--report-only", action="store_true")
-    p.add_argument("--force", action="store_true", help="Re-run DBLoss even if cached result exists")
+    p.add_argument("--force", action="store_true", help="Re-run cached losses even if result exists")
     args = p.parse_args()
     args.dataset = args.dataset.replace(".csv", "")
 
@@ -255,7 +269,7 @@ def main():
             for h in args.horizons:
                 for l in args.losses:
                     cached = read_result(args.dataset, args.model, l, h, args.batch_size, s) is not None
-                    if l == "DBLoss" and not args.force and cached:
+                    if not args.force and cached:
                         print(
                             f"\n===== Skipping {l} | {args.dataset} | {args.model} | horizon={h} | seed={s} (already exists) =====",
                             flush=True,

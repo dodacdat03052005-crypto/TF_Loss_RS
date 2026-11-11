@@ -145,11 +145,15 @@ class HD_DBLoss(nn.Module):
 
     Derived directly from:
       1. Stationary Seasonal I(0) precision:     w_S(h) = 1.0
-      2. Non-stationary Trend I(1) precision:    w_T(h) = (1 + c * (h - 1)) ** (-gamma)
-         (Depends ONLY on physical forecast lead time h = 1, 2, ..., NEVER on horizon length H!)
+      2. Non-stationary Trend I(1) precision:
+         w_T(h) = w_min + (1 - w_min) * (1 + (c_step * (h - 1)) ** p_order) ** (-gamma)
+         - Depends ONLY on physical forecast lead time h = 1, 2, ..., NEVER on horizon length H!
+         - p_order = 1.0: Linear diffusive decay from h = 1.
+         - p_order = 2.0: 2nd-order Butterworth (Inertial-to-Diffusive) kernel with zero slope
+           at h = 1 (dw_T/dh|_{h=1} = 0), preserving short-term Trend L1 anchor for h <= tau_0
+           while decaying rapidly in the unanchored random-walk regime h > tau_0.
       3. Iso-Energy Precision Normalization at each step h (prevents the Evaluation Trap):
          beta(h) = (beta * w_S(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
-                 = beta / (beta + (1 - beta) * (1 + c * (h - 1)) ** (-gamma))
          1 - beta(h) = ((1 - beta) * w_T(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
     """
 
@@ -159,6 +163,8 @@ class HD_DBLoss(nn.Module):
         beta: float = 0.5,
         gamma: float = 1.0,
         c_step: float = 0.015,
+        p_order: float = 1.0,
+        w_min: float = 0.0,
         step_decay: float = 0.0,
         **kwargs,
     ):
@@ -168,6 +174,8 @@ class HD_DBLoss(nn.Module):
         self.beta = float(beta)
         self.gamma = float(gamma)
         self.c_step = float(c_step)
+        self.p_order = float(p_order)
+        self.w_min = float(w_min)
         self.step_decay = float(step_decay)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -189,7 +197,8 @@ class HD_DBLoss(nn.Module):
         # 3. Step-wise precision ratio from Non-Stationary Trend w_T(h) vs Stationary Seasonal w_S(h)=1
         #    Note: h = 1, 2, ..., H is physical lead time (independent of total horizon H!)
         h = torch.arange(1, H + 1, device=device, dtype=dtype).view(1, H, 1)
-        w_T = torch.pow(1.0 + self.c_step * (h - 1.0), -self.gamma)
+        scaled_h = torch.pow(self.c_step * (h - 1.0), self.p_order)
+        w_T = self.w_min + (1.0 - self.w_min) * torch.pow(1.0 + scaled_h, -self.gamma)
 
         # Iso-energy precision share at step h: beta(h) + (1 - beta(h)) == 1.0 for every h
         beta_h = self.beta / (self.beta + (1.0 - self.beta) * w_T + 1e-8)
@@ -197,7 +206,7 @@ class HD_DBLoss(nn.Module):
         step_loss = beta_h * err_season + (1.0 - beta_h) * err_trend_aligned
 
         if self.step_decay != 0.0:
-            w_all = torch.pow(1.0 + self.c_step * (h - 1.0), -self.step_decay)
+            w_all = torch.pow(1.0 + scaled_h, -self.step_decay)
             w_all = w_all / (w_all.mean() + 1e-8)
             step_loss = step_loss * w_all
 
