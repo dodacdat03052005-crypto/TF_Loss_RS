@@ -149,7 +149,7 @@ class HD_DBLoss(nn.Module):
          w_T(h) = w_min + (1 - w_min) * (1 + (c_step * (h - 1)) ** p_order) ** (-gamma)
          - Depends ONLY on physical forecast lead time h = 1, 2, ..., NEVER on horizon length H!
          - p_order = 1.0: Linear diffusive decay from h = 1.
-         - p_order >= 2.0: Butterworth (Inertial-to-Diffusive) kernel with zero slope
+         - p_order = 2.0: 2nd-order Butterworth (Inertial-to-Diffusive) kernel with zero slope
            at h = 1 (dw_T/dh|_{h=1} = 0), preserving short-term Trend L1 anchor for h <= tau_0
            while decaying rapidly in the unanchored random-walk regime h > tau_0.
       3. Iso-Energy Precision Normalization at each step h (prevents the Evaluation Trap):
