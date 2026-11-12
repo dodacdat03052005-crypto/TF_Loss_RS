@@ -76,20 +76,16 @@ LOSS_VARIANTS = {
         "c_step": 0.011,
         "p_order": 2.0,
         "w_min": 0.05,
-        "delta": 0.0,
-        "prec_scale": False,
         "step_decay": 0.0,
     },
-    "HD_DBLoss_V2": {
+    "HD_DBLoss_BW3": {
         "loss": "HD_DBLoss",
         "alpha": 0.2,
         "beta": 0.5,
-        "gamma": 1.25,
-        "c_step": 0.0115,
-        "p_order": 2.2,
-        "w_min": 0.02,
-        "delta": 0.015,
-        "prec_scale": True,
+        "gamma": 1.0,
+        "c_step": 0.009,
+        "p_order": 3.0,
+        "w_min": 0.05,
         "step_decay": 0.0,
     },
     "HD_DBLoss_s2": {
@@ -261,7 +257,7 @@ def main():
     p.add_argument(
         "--losses",
         nargs="+",
-        default=["DBLoss", "HD_DBLoss_BW", "HD_DBLoss_V2"],
+        default=["DBLoss", "HD_DBLoss_BW", "HD_DBLoss_BW3"],
         choices=list(LOSS_VARIANTS),
     )
     p.add_argument("--batch-size", type=int, default=None, help="Override training batch_size (e.g. 128 or 256 for faster GPU runs)")
