@@ -149,12 +149,16 @@ class HD_DBLoss(nn.Module):
          w_T(h) = w_min + (1 - w_min) * (1 + (c_step * (h - 1)) ** p_order) ** (-gamma)
          - Depends ONLY on physical forecast lead time h = 1, 2, ..., NEVER on horizon length H!
          - p_order = 1.0: Linear diffusive decay from h = 1.
-         - p_order = 2.0: 2nd-order Butterworth (Inertial-to-Diffusive) kernel with zero slope
+         - p_order >= 2.0: Butterworth (Inertial-to-Diffusive) kernel with zero slope
            at h = 1 (dw_T/dh|_{h=1} = 0), preserving short-term Trend L1 anchor for h <= tau_0
            while decaying rapidly in the unanchored random-walk regime h > tau_0.
       3. Iso-Energy Precision Normalization at each step h (prevents the Evaluation Trap):
          beta(h) = (beta * w_S(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
          1 - beta(h) = ((1 - beta) * w_T(h)) / (beta * w_S(h) + (1 - beta) * w_T(h))
+      4. Precision-Weighted Scale Alignment (prec_scale=True) & Charbonnier-Huber Trend Loss (delta):
+         - Eliminates Chebyshev covariance distortion between decreasing (1 - beta(h)) and
+           increasing |Delta T_h| by normalizing branch risk under w_tilde_S(h) and w_tilde_T(h).
+         - Smooths L1 gradient chattering near 0 in the short-term inertial zone via Charbonnier delta.
     """
 
     def __init__(
@@ -165,6 +169,8 @@ class HD_DBLoss(nn.Module):
         c_step: float = 0.015,
         p_order: float = 1.0,
         w_min: float = 0.0,
+        delta: float = 0.0,
+        prec_scale: bool = False,
         step_decay: float = 0.0,
         **kwargs,
     ):
@@ -176,6 +182,8 @@ class HD_DBLoss(nn.Module):
         self.c_step = float(c_step)
         self.p_order = float(p_order)
         self.w_min = float(w_min)
+        self.delta = float(delta)
+        self.prec_scale = bool(prec_scale)
         self.step_decay = float(step_decay)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -188,13 +196,15 @@ class HD_DBLoss(nn.Module):
         target_season, target_trend = self.decomp(target)
 
         err_season = (pred_season - target_season) ** 2        # [B, H, C]
-        err_trend = torch.abs(pred_trend - target_trend)       # [B, H, C]
+        diff_trend = pred_trend - target_trend
+        if self.delta > 0.0:
+            err_trend = torch.sqrt(diff_trend * diff_trend + self.delta * self.delta) - self.delta
+            err_trend_norm = torch.sqrt(diff_trend * diff_trend + self.delta * self.delta)
+        else:
+            err_trend = torch.abs(diff_trend)                  # [B, H, C]
+            err_trend_norm = err_trend
 
-        # 2. Global gradient scale alignment (identical to DBLoss)
-        scale = (err_season.mean() / (err_trend.mean() + 1e-8)).detach()
-        err_trend_aligned = err_trend * scale
-
-        # 3. Step-wise precision ratio from Non-Stationary Trend w_T(h) vs Stationary Seasonal w_S(h)=1
+        # 2. Step-wise precision ratio from Non-Stationary Trend w_T(h) vs Stationary Seasonal w_S(h)=1
         #    Note: h = 1, 2, ..., H is physical lead time (independent of total horizon H!)
         h = torch.arange(1, H + 1, device=device, dtype=dtype).view(1, H, 1)
         scaled_h = torch.pow(self.c_step * (h - 1.0), self.p_order)
@@ -202,8 +212,20 @@ class HD_DBLoss(nn.Module):
 
         # Iso-energy precision share at step h: beta(h) + (1 - beta(h)) == 1.0 for every h
         beta_h = self.beta / (self.beta + (1.0 - self.beta) * w_T + 1e-8)
+        one_minus_beta_h = 1.0 - beta_h
 
-        step_loss = beta_h * err_season + (1.0 - beta_h) * err_trend_aligned
+        # 3. Gradient scale alignment (Precision-Weighted vs Unweighted)
+        if self.prec_scale:
+            w_tilde_s = beta_h / (beta_h.mean() + 1e-8)
+            w_tilde_t = one_minus_beta_h / (one_minus_beta_h.mean() + 1e-8)
+            loss_s_norm = (w_tilde_s * err_season).mean()
+            loss_t_norm = (w_tilde_t * err_trend_norm).mean()
+            scale = (loss_s_norm / (loss_t_norm + 1e-8)).detach()
+        else:
+            scale = (err_season.mean() / (err_trend_norm.mean() + 1e-8)).detach()
+
+        err_trend_aligned = err_trend * scale
+        step_loss = beta_h * err_season + one_minus_beta_h * err_trend_aligned
 
         if self.step_decay != 0.0:
             w_all = torch.pow(1.0 + scaled_h, -self.step_decay)

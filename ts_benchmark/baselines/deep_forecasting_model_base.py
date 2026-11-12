@@ -44,6 +44,8 @@ DEFAULT_HYPER_PARAMS = {
     "c_step": 0.015,
     "p_order": 1.0,
     "w_min": 0.0,
+    "delta": 0.0,
+    "prec_scale": False,
     "step_decay": 0.0,
 }
 
@@ -150,6 +152,8 @@ class DeepForecastingModelBase(ModelBase):
                 c_step=self.config.c_step,
                 p_order=self.config.p_order,
                 w_min=self.config.w_min,
+                delta=self.config.delta,
+                prec_scale=self.config.prec_scale,
                 step_decay=self.config.step_decay,
             )
         else:
